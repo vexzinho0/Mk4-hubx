@@ -5,12 +5,15 @@
    Tema: vermelho / preto (WindUI:AddTheme)
    Tabs: Farm, Events, Bau, Frutas, Utilitarios
 
-   v2:
+   v3:
+   - Ataque de verdade: tweak no CombatFramework (activeController) +
+     Tool:Activate + clique virtual, com metodo selecionavel
+   - Magnet puxa APENAS NPCs hostis (sem ProximityPrompt/ClickDetector,
+     sem lojistas/quest givers/anchorados)
+   - Bau com teleporte instantaneo e espera longa quando o servidor
+     recusa, para nao travar em um bau inalcancavel
    - Todos os recursos rodam em loops persistentes (scheduler com pcall
      e auto-restart, nada morre silenciosamente)
-   - Auto Farm com "Puxar Mobs (Magnet)": traz todos os NPCs do raio
-     para uma roda ao redor do player e mantem eles ali, e a Kill Aura
-     bate em todos juntos
    - Remotes reais do jogo (dump PlaceId 2753915549):
        Remotes.CommF_ (RemoteFunction)  Remotes.CommE
        Remotes.Chest                    Remotes.Prompt
@@ -103,6 +106,11 @@ local Config = {
 		Speed = 130,
 		AttackDelay = 0.15,
 		FastAttack = true,
+		AttackMethod = "Auto (todos)",
+		CombatTweak = true,
+		AttackIncrement = 4,
+		HitboxMagnitude = 150,
+		AutoEquip = true,
 		Pull = true,
 		PullRadius = 600,
 		PullDistance = 6,
@@ -120,6 +128,7 @@ local Config = {
 		Delay = 0.15,
 		Radius = 500,
 		UseRemote = true,
+		Instant = true,
 	},
 	Fruit = {
 		Enabled = false,
@@ -279,7 +288,163 @@ local function getWeapon()
 	return char:FindFirstChildOfClass("Tool")
 end
 
-local function attackOnce()
+-- ---------------- COMBATE ----------------
+-- tool:Activate() sozinho nao registra hit no Blox Fruits: quem manda no
+-- ataque e o CombatFramework (PlayerScripts). Alem de ativar a arma,
+-- mexemos no activeController e mandamos clique virtual.
+local combatController = nil
+local lastCombatLookup = 0
+
+local function getCombatController()
+	if combatController and combatController.Parent ~= nil then
+		return combatController
+	end
+	if (os.clock() - lastCombatLookup) < 5 then
+		return combatController
+	end
+	lastCombatLookup = os.clock()
+	if not getreg or not getfenv or not debug or not debug.getupvalues then
+		return nil
+	end
+	local ok, found = pcall(function()
+		for _, fn in pairs(getreg()) do
+			if type(fn) == "function" then
+				local envOk, env = pcall(getfenv, fn)
+				if envOk and type(env) == "table" and env.script and env.script.Name == "CombatFramework" then
+					for _, up in pairs(debug.getupvalues(fn)) do
+						if type(up) == "table" and up.activeController then
+							return up.activeController
+						end
+					end
+				end
+			end
+		end
+	end)
+	if ok and found then
+		combatController = found
+	end
+	return combatController
+end
+
+local function boostCombat()
+	if not Config.Farm.CombatTweak then
+		return
+	end
+	local controller = getCombatController()
+	if not controller then
+		return
+	end
+	pcall(function()
+		controller.timeToNextAttack = -(math.huge ^ math.huge ^ math.huge)
+		controller.attacking = false
+		controller.increment = Config.Farm.AttackIncrement
+		controller.blocking = false
+		controller.hitboxMagnitude = Config.Farm.HitboxMagnitude
+		controller.focusStart = 0
+		if controller.humanoid then
+			controller.humanoid.AutoRotate = true
+		end
+	end)
+end
+
+local MELEE_KEYWORDS = { "sword", "katana", "blade", "cutlass", "saber", "melee", "combat", "claw", "axe", "mace", "trident", "spear", "gun", "fruit" }
+
+local lastEquipTry = 0
+local function ensureWeapon()
+	if not Config.Farm.AutoEquip then
+		return
+	end
+	if (os.clock() - lastEquipTry) < 1 then
+		return
+	end
+	lastEquipTry = os.clock()
+	local char, _, hum = getChar()
+	if not char or not hum then
+		return
+	end
+	if char:FindFirstChildOfClass("Tool") then
+		return
+	end
+	local backpack = LP:FindFirstChild("Backpack")
+	if not backpack then
+		return
+	end
+	local fallback
+	for _, item in ipairs(backpack:GetChildren()) do
+		if item:IsA("Tool") then
+			fallback = fallback or item
+			local lower = item.Name:lower()
+			for _, word in ipairs(MELEE_KEYWORDS) do
+				if lower:find(word, 1, true) then
+					pcall(function()
+						hum:EquipTool(item)
+					end)
+					return
+				end
+			end
+		end
+	end
+	if fallback then
+		pcall(function()
+			hum:EquipTool(fallback)
+		end)
+	end
+end
+
+local function facePosition(position)
+	local hrp = getHRP()
+	if not hrp or not position then
+		return
+	end
+	pcall(function()
+		hrp.CFrame = CFrame.new(hrp.Position, Vector3.new(position.X, hrp.Position.Y, position.Z))
+	end)
+end
+
+local function virtualClick()
+	local point = Vector2.new(0, 0)
+	local camera = Workspace.CurrentCamera
+	local ok = pcall(function()
+		VirtualUser:CaptureController()
+		if camera then
+			VirtualUser:Button1Down(point, camera.CFrame)
+			VirtualUser:Button1Up(point, camera.CFrame)
+		else
+			VirtualUser:Button1Down(point)
+			VirtualUser:Button1Up(point)
+		end
+	end)
+	if not ok and mouse1click then
+		pcall(mouse1click)
+	end
+end
+
+local function attack(position)
+	ensureWeapon()
+	boostCombat()
+	if position then
+		facePosition(position)
+	end
+
+	local method = Config.Farm.AttackMethod
+	if method == "CommF Attack" then
+		invoke("Attack")
+		return
+	elseif method == "Tool:Activate" then
+		local tool = getWeapon()
+		if tool then
+			pcall(function()
+				tool:Activate()
+			end)
+		end
+		return
+	elseif method == "Clique virtual" then
+		virtualClick()
+		return
+	end
+
+	-- Auto: ativa a arma e manda clique virtual (o CombatFramework
+	-- interpreta os dois como ataque)
 	local tool = getWeapon()
 	if tool then
 		pcall(function()
@@ -287,7 +452,11 @@ local function attackOnce()
 		end)
 	elseif not warnedNoWeapon then
 		warnedNoWeapon = true
-		notify("MK4 Hubx", "Equipe uma arma/fruta para o auto farm atacar.", "alert-triangle", 6)
+		notify("MK4 Hubx", "Equipe uma arma/fruta (ou ligue Auto Equip).", "alert-triangle", 6)
+	end
+	virtualClick()
+	if not tool then
+		invoke("Attack")
 	end
 end
 
@@ -327,6 +496,47 @@ end
 local mobCache = nil
 local mobCacheTime = 0
 
+-- NPCs com interacao (lojas, quest givers, barcos) nunca entram no magnet
+local NON_ATTACKABLE = {
+	"dealer", "quest", "giver", "cousin", "shop", "seller", "merchant", "store",
+	"teacher", "trainer", "haki", "boat", "shipwright", "spawn", "portal", "npc",
+	"dialog", "sign", "barrel", "chest", "stand",
+}
+
+local function isAttackable(model)
+	local myChar = LP.Character
+	if not model:IsA("Model") then
+		return false
+	end
+	if myChar and (model == myChar or model:IsDescendantOf(myChar)) then
+		return false
+	end
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	local hrp = model:FindFirstChild("HumanoidRootPart")
+	if not hum or not hrp or hum.Health <= 0 then
+		return false
+	end
+	for _, desc in ipairs(model:GetDescendants()) do
+		if desc:IsA("ProximityPrompt") or desc:IsA("ClickDetector") or desc:IsA("Dialog") then
+			return false
+		end
+	end
+	local enemiesFolder = Workspace:FindFirstChild("Enemies")
+	local inEnemies = enemiesFolder ~= nil and model:IsDescendantOf(enemiesFolder)
+	if not inEnemies then
+		local lower = model.Name:lower()
+		for _, blocked in ipairs(NON_ATTACKABLE) do
+			if lower:find(blocked, 1, true) then
+				return false
+			end
+		end
+		if hrp.Anchored then
+			return false
+		end
+	end
+	return true
+end
+
 local function collectMobs(force)
 	if not force and mobCache and (os.clock() - mobCacheTime) < 0.2 then
 		return mobCache
@@ -336,6 +546,9 @@ local function collectMobs(force)
 
 	local function add(model)
 		if seen[model] or model == LP.Character then
+			return
+		end
+		if not isAttackable(model) then
 			return
 		end
 		local hum = model:FindFirstChildOfClass("Humanoid")
@@ -569,7 +782,7 @@ local function killAura()
 		end
 	end
 	if best then
-		attackOnce()
+		attack(best.Root.Position)
 	end
 end
 
@@ -603,7 +816,7 @@ local function farmTarget(target, keepGoing)
 			lastBuso = os.clock()
 			invoke("Buso")
 		end
-		attackOnce()
+		attack(mhrp.Position)
 		task.wait(Config.Farm.FastAttack and Config.Farm.AttackDelay or 0.45)
 	end
 end
@@ -630,7 +843,18 @@ local function collectChest(entry)
 	if not hrp then
 		return false
 	end
-	moveTo(part.Position + Vector3.new(0, 3, 0), Config.Chest.Speed)
+
+	-- Teleporte instantaneo: com tween o trajeto longo (raio alto) gastava
+	-- segundos e o player caia no meio do caminho, nunca chegando no bau.
+	if Config.Chest.Instant then
+		pcall(function()
+			hrp.CFrame = CFrame.new(part.Position + Vector3.new(0, 3, 0))
+		end)
+		task.wait(0.05)
+	else
+		moveTo(part.Position + Vector3.new(0, 3, 0), Config.Chest.Speed)
+	end
+
 	if Config.Chest.UseRemote then
 		fireOn(REMOTES.Chest, entry.Instance)
 		fireOn(REMOTES.Chest, part)
@@ -644,10 +868,18 @@ local function collectChest(entry)
 			firetouchinterest(hrp, part, 1)
 		end)
 	else
-		hrp.CFrame = part.CFrame
+		pcall(function()
+			hrp.CFrame = part.CFrame
+		end)
 		task.wait(0.1)
 	end
 	interact(entry.Instance)
+	task.wait(0.3)
+
+	-- Se o bau continuou no mapa, o servidor recusou: coloca em espera longa
+	if part.Parent and entry.Instance.Parent then
+		chestCooldown[entry.Instance] = os.clock() + 20
+	end
 	return true
 end
 
@@ -1218,6 +1450,70 @@ FarmSection:Toggle({
 	end,
 })
 
+local CombatSection = FarmTab:Section({ Title = "Combate" })
+
+CombatSection:Dropdown({
+	Title = "Metodo de ataque",
+	Desc = "Auto = ativa a arma + clique virtual (mais confiavel)",
+	Values = { "Auto (todos)", "CommF Attack", "Tool:Activate", "Clique virtual" },
+	Value = "Auto (todos)",
+	Callback = function(option)
+		Config.Farm.AttackMethod = option
+	end,
+})
+
+CombatSection:Toggle({
+	Title = "Combat tweak (ataque rapido real)",
+	Desc = "Ajusta o CombatFramework: cooldown 0, increment e hitbox",
+	Value = true,
+	Callback = function(state)
+		Config.Farm.CombatTweak = state
+	end,
+})
+
+CombatSection:Slider({
+	Title = "Increment",
+	Desc = "Quantos hits por ativacao o CombatFramework manda",
+	Step = 1,
+	Value = { Min = 1, Max = 20, Default = 4 },
+	Callback = function(value)
+		Config.Farm.AttackIncrement = value
+	end,
+})
+
+CombatSection:Slider({
+	Title = "Hitbox",
+	Desc = "Alcance do golpe",
+	Step = 10,
+	Value = { Min = 30, Max = 500, Default = 150 },
+	Callback = function(value)
+		Config.Farm.HitboxMagnitude = value
+	end,
+})
+
+CombatSection:Toggle({
+	Title = "Auto Equip",
+	Desc = "Equipa arma da mochila se nenhuma estiver na mao",
+	Value = true,
+	Callback = function(state)
+		Config.Farm.AutoEquip = state
+	end,
+})
+
+CombatSection:Button({
+	Title = "Testar ataque",
+	Desc = "Ataca o mob mais proximo uma vez (conferir no jogo)",
+	Callback = function()
+		local mob = nearestMob(Config.Farm.Radius)
+		if mob then
+			attack(mob.Root.Position)
+			notify("Combate", "Ataque enviado em " .. mob.Name .. " (metodo: " .. Config.Farm.AttackMethod .. ")", "swords", 4)
+		else
+			notify("Combate", "Nenhum mob atacavel no raio", "alert-triangle", 4)
+		end
+	end,
+})
+
 local QuestSection = FarmTab:Section({ Title = "Quest" })
 
 QuestSection:Toggle({
@@ -1385,6 +1681,15 @@ ChestSection:Toggle({
 	Value = true,
 	Callback = function(state)
 		Config.Chest.UseRemote = state
+	end,
+})
+
+ChestSection:Toggle({
+	Title = "Teleporte instantaneo",
+	Desc = "Recomendado: alcanca baus longe sem cair no caminho",
+	Value = true,
+	Callback = function(state)
+		Config.Chest.Instant = state
 	end,
 })
 
@@ -1706,6 +2011,20 @@ DebugSection:Button({
 			end
 		end
 		notify("MK4 Hubx", "Lista impressa no console (F9)", "terminal", 4)
+	end,
+})
+
+DebugSection:Button({
+	Title = "Diagnostico de combate",
+	Desc = "Mostra arma equipada e se o CombatFramework foi achado",
+	Callback = function()
+		local tool = getWeapon()
+		print("[MK4 Hubx] arma equipada:", tool and tool.Name or "NENHUMA")
+		print("[MK4 Hubx] CombatFramework:", getCombatController() and "OK (tweak ativo)" or "NAO ENCONTRADO")
+		print("[MK4 Hubx] metodo de ataque:", Config.Farm.AttackMethod)
+		print("[MK4 Hubx] executor tem getreg/getfenv:", tostring(getreg ~= nil), tostring(getfenv ~= nil))
+		print("[MK4 Hubx] mobs atacaveis no mapa:", #collectMobs(true))
+		notify("MK4 Hubx", "Diagnostico impresso no console (F9)", "terminal", 5)
 	end,
 })
 
