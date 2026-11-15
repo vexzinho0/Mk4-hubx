@@ -1,13 +1,24 @@
 --[[
 =====================================================================
-   MK4 HUBX  |  Blox Fruits  |  WindUI  |  Sem Key
+   MK4 HUBX v2  |  Blox Fruits  |  WindUI  |  Sem Key
 ---------------------------------------------------------------------
+   Tema: vermelho / preto (WindUI:AddTheme)
    Tabs: Farm, Events, Bau, Frutas, Utilitarios
-   Recursos: Auto Farm, Auto Quest, Kill Aura / Fast Attack, Auto Buso,
-             Auto Events (Sea Beast, Elite, Factory, Cursed Ship,
-             Ghost Ship, Dough King, Darkbeard, Kitsune),
-             Auto Bau, Auto Frutas, Auto Rolar / Comprar Frutas,
-             Teleportes, Server Hop, Anti-AFK e Remote Spy.
+
+   v2:
+   - Todos os recursos rodam em loops persistentes (scheduler com pcall
+     e auto-restart, nada morre silenciosamente)
+   - Auto Farm com "Puxar Mobs (Magnet)": traz todos os NPCs do raio
+     para uma roda ao redor do player e mantem eles ali, e a Kill Aura
+     bate em todos juntos
+   - Remotes reais do jogo (dump PlaceId 2753915549):
+       Remotes.CommF_ (RemoteFunction)  Remotes.CommE
+       Remotes.Chest                    Remotes.Prompt
+       Remotes.Raids                    Remotes.OnTalkToNPC
+       Remotes.GetBestQuestNPC          Remotes.GetFruitData
+       Modules.Net["RE/SpinGacha"]      Modules.Net["RE/ShopNetwork"]
+       Modules.Net["RE/GachaNetworkRE"] Remotes.SetLocalMovers
+       Remotes.BodyMover                Remotes.DoRejoin
 
    Execucao:
      loadstring(game:HttpGet("SEU_LINK_AQUI"))()
@@ -15,7 +26,7 @@
 ]]
 
 --=====================================================================
--- 0. CARREGAMENTO DA WINDUI
+-- 0. WINDUI
 --=====================================================================
 local windOk, WindUI = pcall(function()
 	return loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
@@ -26,10 +37,11 @@ if not windOk or not WindUI then
 end
 
 --=====================================================================
--- 1. SERVICOS E REFERENCIAS
+-- 1. SERVICOS / REMOTES
 --=====================================================================
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local VirtualUser = game:GetService("VirtualUser")
 local TeleportService = game:GetService("TeleportService")
@@ -39,13 +51,40 @@ local Workspace = workspace
 local LP = Players.LocalPlayer
 
 local Remotes = ReplicatedStorage:WaitForChild("Remotes", 30)
-local CommF = Remotes and Remotes:FindFirstChild("CommF_")
-local CommE = Remotes and Remotes:FindFirstChild("CommE")
+local ModulesNet = ReplicatedStorage:FindFirstChild("Modules")
+ModulesNet = ModulesNet and ModulesNet:FindFirstChild("Net")
 
-if not CommF then
+local function getRemote(container, name)
+	if not container then
+		return nil
+	end
+	return container:FindFirstChild(name)
+end
+
+local REMOTES = {
+	CommF = getRemote(Remotes, "CommF_"),
+	CommE = getRemote(Remotes, "CommE"),
+	Chest = getRemote(Remotes, "Chest"),
+	Prompt = getRemote(Remotes, "Prompt"),
+	Raids = getRemote(Remotes, "Raids"),
+	OnTalkToNPC = getRemote(Remotes, "OnTalkToNPC"),
+	GetBestQuestNPC = getRemote(Remotes, "GetBestQuestNPC"),
+	GetFruitData = getRemote(Remotes, "GetFruitData"),
+	DoRejoin = getRemote(Remotes, "DoRejoin"),
+	SetLocalMovers = getRemote(Remotes, "SetLocalMovers"),
+	BodyMover = getRemote(Remotes, "BodyMover"),
+	SegmentHit = getRemote(Remotes, "SegmentHit"),
+	QuestUpdate = getRemote(Remotes, "QuestUpdate"),
+	SpinGacha = getRemote(ModulesNet, "RE/SpinGacha"),
+	GachaNetwork = getRemote(ModulesNet, "RE/GachaNetworkRE"),
+	ShopNetwork = getRemote(ModulesNet, "RE/ShopNetwork"),
+	ReadPlayerData = getRemote(ModulesNet, "RF/ReadPlayerData"),
+}
+
+if not REMOTES.CommF then
 	WindUI:Notify({
 		Title = "MK4 Hubx",
-		Content = "Nao encontrei os Remotes do Blox Fruits. Execute o script dentro do jogo.",
+		Content = "Remotes do Blox Fruits nao encontrados. Execute dentro do jogo.",
 		Icon = "x",
 		Duration = 8,
 	})
@@ -53,7 +92,7 @@ if not CommF then
 end
 
 --=====================================================================
--- 2. CONFIGURACAO GLOBAL
+-- 2. CONFIG
 --=====================================================================
 local Config = {
 	Farm = {
@@ -64,7 +103,13 @@ local Config = {
 		Speed = 130,
 		AttackDelay = 0.15,
 		FastAttack = true,
+		Pull = true,
+		PullRadius = 600,
+		PullDistance = 6,
+		KillAura = true,
+		AuraRadius = 40,
 		AutoQuest = false,
+		UseBestQuest = true,
 		QuestId = "BanditQuest1",
 		QuestLevel = 1,
 		AutoBuso = false,
@@ -73,7 +118,8 @@ local Config = {
 		Enabled = false,
 		Speed = 170,
 		Delay = 0.15,
-		Radius = 400,
+		Radius = 500,
+		UseRemote = true,
 	},
 	Fruit = {
 		Enabled = false,
@@ -88,18 +134,18 @@ local Config = {
 		Notify = true,
 		Reroll = false,
 	},
-	Events = {}, -- preenchido depois com Config.Events[id] = false
+	Events = {},
 	Misc = {
 		AntiAfk = true,
 	},
 }
 
-local Connections = {}
 local currentTween = nil
 local busyAction = false
+local warnedNoWeapon = false
 
 --=====================================================================
--- 3. HELPERS GERAIS
+-- 3. HELPERS
 --=====================================================================
 local function notify(title, content, icon, duration)
 	pcall(function()
@@ -112,10 +158,14 @@ local function notify(title, content, icon, duration)
 	end)
 end
 
-local function invoke(...)
+-- Invoke seguro em qualquer RemoteFunction
+local function invokeOn(remote, ...)
+	if not remote then
+		return nil
+	end
 	local args = table.pack(...)
 	local ok, result = pcall(function()
-		return CommF:InvokeServer(table.unpack(args, 1, args.n))
+		return remote:InvokeServer(table.unpack(args, 1, args.n))
 	end)
 	if ok then
 		return result
@@ -123,14 +173,24 @@ local function invoke(...)
 	return nil
 end
 
-local function fireRemote(...)
-	if not CommE then
-		return
+-- Fire seguro em qualquer RemoteEvent
+local function fireOn(remote, ...)
+	if not remote then
+		return false
 	end
 	local args = table.pack(...)
-	pcall(function()
-		CommE:FireServer(table.unpack(args, 1, args.n))
+	local ok = pcall(function()
+		remote:FireServer(table.unpack(args, 1, args.n))
 	end)
+	return ok
+end
+
+local function invoke(...)
+	return invokeOn(REMOTES.CommF, ...)
+end
+
+local function fireRemote(...)
+	return fireOn(REMOTES.CommE, ...)
 end
 
 local function getChar()
@@ -166,7 +226,6 @@ local function getBeli()
 	return getStat("Beli") or 0
 end
 
--- Movimento suave ate uma posicao (evita teleporte seco/caindo do mapa)
 local function moveTo(position, speed)
 	local hrp = getHRP()
 	if not hrp then
@@ -220,7 +279,6 @@ local function getWeapon()
 	return char:FindFirstChildOfClass("Tool")
 end
 
-local warnedNoWeapon = false
 local function attackOnce()
 	local tool = getWeapon()
 	if tool then
@@ -229,15 +287,19 @@ local function attackOnce()
 		end)
 	elseif not warnedNoWeapon then
 		warnedNoWeapon = true
-		notify("MK4 Hubx", "Equipe uma arma (espada / fruta) para o auto farm atacar.", "alert-triangle", 6)
+		notify("MK4 Hubx", "Equipe uma arma/fruta para o auto farm atacar.", "alert-triangle", 6)
 	end
 end
 
--- Interage com ProximityPrompt / ClickDetector (baus, frutas no chao, etc.)
+-- ProximityPrompt: usa o remote Remotes.Prompt quando existir, com
+-- fallback para InputHoldBegin/End e ClickDetector.
 local function interact(instance)
 	for _, desc in ipairs(instance:GetDescendants()) do
 		if desc:IsA("ProximityPrompt") then
 			local hold = desc.HoldDuration or 0
+			if REMOTES.Prompt then
+				fireOn(REMOTES.Prompt, desc)
+			end
 			pcall(function()
 				desc:InputHoldBegin()
 			end)
@@ -260,9 +322,15 @@ local function interact(instance)
 end
 
 --=====================================================================
--- 4. COLETA DE MOBS / BAUIS / FRUTAS
+-- 4. LEITURA DO MUNDO
 --=====================================================================
-local function collectMobs()
+local mobCache = nil
+local mobCacheTime = 0
+
+local function collectMobs(force)
+	if not force and mobCache and (os.clock() - mobCacheTime) < 0.2 then
+		return mobCache
+	end
 	local list = {}
 	local seen = {}
 
@@ -297,6 +365,8 @@ local function collectMobs()
 		end
 	end
 
+	mobCache = list
+	mobCacheTime = os.clock()
 	return list
 end
 
@@ -321,13 +391,21 @@ local function nearestMob(radius, filterName)
 	return best
 end
 
--- Cache de baus (evita varrer o mapa inteiro a cada ciclo)
 local chestCache = {}
 local lastChestScan = 0
+local chestCooldown = {}
+local fruitCooldown = {}
+
+-- Evita repetir o mesmo bau/fruta sem parar (spam de remote)
+local function onCooldown(map, instance, seconds)
+	local last = map[instance]
+	return last ~= nil and (os.clock() - last) < (seconds or 8)
+end
 
 local function isChestName(name)
 	local lower = name:lower()
-	return lower == "chest" or lower == "chest2" or lower == "chest3" or lower:find("chest", 1, true) ~= nil
+	return lower == "chest" or lower == "chest2" or lower == "chest3"
+		or lower:find("chest", 1, true) ~= nil
 		or lower:find("treasure", 1, true) ~= nil
 		or lower:find("bau", 1, true) ~= nil
 end
@@ -336,23 +414,19 @@ local function scanChests()
 	local found = {}
 	for _, region in ipairs(Workspace:GetChildren()) do
 		if region:IsA("Folder") or region:IsA("Model") then
-			local candidates = {}
 			local ok, descendants = pcall(function()
 				return region:GetDescendants()
 			end)
 			if ok then
 				for _, desc in ipairs(descendants) do
 					if isChestName(desc.Name) and (desc:IsA("Model") or desc:IsA("BasePart")) then
-						candidates[#candidates + 1] = desc
+						local part = desc:IsA("BasePart") and desc
+							or desc.PrimaryPart
+							or desc:FindFirstChildWhichIsA("BasePart")
+						if part then
+							found[#found + 1] = { Instance = desc, Part = part }
+						end
 					end
-				end
-			end
-			for _, desc in ipairs(candidates) do
-				local part = desc:IsA("BasePart") and desc
-					or desc.PrimaryPart
-					or desc:FindFirstChildWhichIsA("BasePart")
-				if part then
-					found[#found + 1] = { Instance = desc, Part = part }
 				end
 			end
 		end
@@ -377,7 +451,7 @@ local function nearestChest(radius)
 	local best, bestDistance = nil, radius or 400
 	for _, entry in ipairs(chestCache) do
 		local part = entry.Part
-		if part and part.Parent and part:IsDescendantOf(Workspace) then
+		if part and part.Parent and part:IsDescendantOf(Workspace) and not onCooldown(chestCooldown, entry.Instance, 8) then
 			local distance = (part.Position - hrp.Position).Magnitude
 			if distance < bestDistance then
 				best, bestDistance = entry, distance
@@ -387,44 +461,6 @@ local function nearestChest(radius)
 	return best
 end
 
-local function touchPart(part)
-	local hrp = getHRP()
-	if not hrp or not part then
-		return
-	end
-	if firetouchinterest then
-		pcall(function()
-			firetouchinterest(hrp, part, 0)
-		end)
-		task.wait(0.05)
-		pcall(function()
-			firetouchinterest(hrp, part, 1)
-		end)
-	else
-		hrp.CFrame = part.CFrame
-		task.wait(0.1)
-	end
-end
-
-local function collectChest(entry)
-	local part = entry.Part
-	if not part or not part.Parent then
-		return false
-	end
-	local hrp = getHRP()
-	if not hrp then
-		return false
-	end
-	moveTo(part.Position + Vector3.new(0, 3, 0), Config.Chest.Speed)
-	touchPart(part)
-	if not interact(entry.Instance) then
-		task.wait(0.1)
-		touchPart(part)
-	end
-	return true
-end
-
--- Frutas no chao: Tools/Models com nome "Fruta-Fruta" (ex: Rocket-Rocket)
 local function isFruit(instance)
 	if instance:IsDescendantOf(LP.Character) then
 		return false
@@ -478,7 +514,7 @@ local function nearestFruit()
 	local best, bestDistance = nil, math.huge
 	for _, fruit in ipairs(scanFruits()) do
 		local part = fruit.Part
-		if part and part.Parent then
+		if part and part.Parent and not onCooldown(fruitCooldown, fruit.Instance, 8) then
 			local distance = (part.Position - hrp.Position).Magnitude
 			if distance < bestDistance then
 				best, bestDistance = fruit, distance
@@ -491,11 +527,53 @@ end
 --=====================================================================
 -- 5. COMBATE / FARM
 --=====================================================================
-local function startQuest()
-	invoke("StartQuest", Config.Farm.QuestId, Config.Farm.QuestLevel)
+-- Puxa todos os NPCs do raio para uma roda ao redor do player.
+-- NPCs em Blox Fruits costumam ter network ownership do jogador mais
+-- proximo, por isso escrever o CFrame replica para o servidor.
+local function pullMobs()
+	local hrp = getHRP()
+	if not hrp then
+		return 0
+	end
+	local pulled = 0
+	local ring = Config.Farm.PullDistance
+	local origin = hrp.Position
+	for _, mob in ipairs(collectMobs()) do
+		local mhrp = mob.Root
+		local delta = mhrp.Position - origin
+		local distance = delta.Magnitude
+		if distance <= Config.Farm.PullRadius and distance > ring then
+			pulled = pulled + 1
+			local angle = (pulled * 2.399963) % (math.pi * 2)
+			local target = origin
+				+ Vector3.new(math.cos(angle) * ring, 2, math.sin(angle) * ring)
+			pcall(function()
+				mhrp.CFrame = CFrame.new(target, Vector3.new(origin.X, target.Y, origin.Z))
+				mhrp.AssemblyLinearVelocity = Vector3.zero
+			end)
+		end
+	end
+	return pulled
 end
 
--- keepGoing: funcao que decide se o combate continua (farm ou evento)
+local function killAura()
+	local hrp = getHRP()
+	if not hrp then
+		return
+	end
+	local best, bestDistance = nil, Config.Farm.AuraRadius
+	for _, mob in ipairs(collectMobs()) do
+		local distance = (mob.Root.Position - hrp.Position).Magnitude
+		if distance <= bestDistance and mob.Humanoid.Health > 0 then
+			best, bestDistance = mob, distance
+		end
+	end
+	if best then
+		attackOnce()
+	end
+end
+
+-- keepGoing: funcao que decide se o combate continua
 local function farmTarget(target, keepGoing)
 	if not target then
 		return
@@ -508,14 +586,17 @@ local function farmTarget(target, keepGoing)
 	local active = keepGoing or function()
 		return Config.Farm.Enabled
 	end
-	moveTo(mhrp.Position + Vector3.new(0, 3, 0), Config.Farm.Speed)
+
+	if not Config.Farm.Pull then
+		moveTo(mhrp.Position + Vector3.new(0, 3, 0), Config.Farm.Speed)
+	end
 
 	while active() and mob.Parent and mhum.Health > 0 and (os.clock() - started) < 8 do
 		local hrp = getHRP()
 		if not hrp then
 			break
 		end
-		if (hrp.Position - mhrp.Position).Magnitude > 14 then
+		if not Config.Farm.Pull and (hrp.Position - mhrp.Position).Magnitude > 14 then
 			hrp.CFrame = CFrame.new(mhrp.Position + Vector3.new(0, 3, 0))
 		end
 		if Config.Farm.AutoBuso and (os.clock() - lastBuso) > 2 then
@@ -523,42 +604,51 @@ local function farmTarget(target, keepGoing)
 			invoke("Buso")
 		end
 		attackOnce()
-		if not Config.Farm.FastAttack then
-			task.wait(0.45)
-		else
-			task.wait(Config.Farm.AttackDelay)
-		end
+		task.wait(Config.Farm.FastAttack and Config.Farm.AttackDelay or 0.45)
 	end
 end
 
-local function farmLoop()
-	task.spawn(function()
-		local lastQuestStart = 0
-		while true do
-			task.wait(0.1)
-			if Config.Farm.Enabled then
-				if getChar() then
-					local filter = Config.Farm.Mode == "Mob especifico" and Config.Farm.Mob or nil
-					local target = nearestMob(Config.Farm.Radius, filter)
-					if target then
-						farmTarget(target, function()
-							return Config.Farm.Enabled
-						end)
-					elseif Config.Farm.AutoQuest then
-						if (os.clock() - lastQuestStart) > 5 then
-							lastQuestStart = os.clock()
-							startQuest()
-						end
-						task.wait(0.5)
-					else
-						task.wait(0.5)
-					end
-				end
-			else
-				task.wait(0.2)
-			end
+local function startQuest()
+	local questId = Config.Farm.QuestId
+	-- GetBestQuestNPC: escolhe a melhor quest pro nivel atual quando existir
+	if Config.Farm.UseBestQuest and REMOTES.GetBestQuestNPC then
+		local best = invokeOn(REMOTES.GetBestQuestNPC)
+		if type(best) == "string" and #best > 0 then
+			questId = best
 		end
-	end)
+	end
+	invoke("StartQuest", questId, Config.Farm.QuestLevel)
+end
+
+local function collectChest(entry)
+	local part = entry.Part
+	if not part or not part.Parent then
+		return false
+	end
+	chestCooldown[entry.Instance] = os.clock()
+	local hrp = getHRP()
+	if not hrp then
+		return false
+	end
+	moveTo(part.Position + Vector3.new(0, 3, 0), Config.Chest.Speed)
+	if Config.Chest.UseRemote then
+		fireOn(REMOTES.Chest, entry.Instance)
+		fireOn(REMOTES.Chest, part)
+	end
+	if firetouchinterest then
+		pcall(function()
+			firetouchinterest(hrp, part, 0)
+		end)
+		task.wait(0.05)
+		pcall(function()
+			firetouchinterest(hrp, part, 1)
+		end)
+	else
+		hrp.CFrame = part.CFrame
+		task.wait(0.1)
+	end
+	interact(entry.Instance)
+	return true
 end
 
 --=====================================================================
@@ -589,7 +679,6 @@ local function matchesEventName(name, names)
 	return false
 end
 
--- Retorna o primeiro mob que bate com algum evento ativo
 local function findEventTarget()
 	for id, enabled in pairs(Config.Events) do
 		if enabled then
@@ -606,82 +695,9 @@ local function findEventTarget()
 	return nil
 end
 
-local function eventLoop()
-	task.spawn(function()
-		local lastNotice = 0
-		while true do
-			task.wait(0.25)
-			local anyActive = false
-			for _, enabled in pairs(Config.Events) do
-				if enabled then
-					anyActive = true
-					break
-				end
-			end
-			if anyActive then
-				local mob, id = findEventTarget()
-				if mob then
-					if (os.clock() - lastNotice) > 5 then
-						lastNotice = os.clock()
-						notify("Evento", ("Engajando: %s (%s)"):format(mob.Name, EVENT_TARGETS[id].label), "swords", 3)
-					end
-					farmTarget(mob, function()
-						return Config.Events[id] == true
-					end)
-				end
-			else
-				task.wait(0.5)
-			end
-		end
-	end)
-end
-
 --=====================================================================
--- 7. BAUIS / FRUTAS / ROLAGEM
+-- 7. FRUTAS / ROLAGEM
 --=====================================================================
-local function chestLoop()
-	task.spawn(function()
-		while true do
-			task.wait(Config.Chest.Delay)
-			if Config.Chest.Enabled then
-				local chest = nearestChest(Config.Chest.Radius)
-				if chest then
-					pcall(collectChest, chest)
-				else
-					task.wait(0.6)
-				end
-			else
-				task.wait(0.3)
-			end
-		end
-	end)
-end
-
-local function fruitLoop()
-	task.spawn(function()
-		while true do
-			task.wait(Config.Fruit.Delay)
-			if Config.Fruit.Enabled then
-				local fruit = nearestFruit()
-				if fruit then
-					local fruitName = fruit.Instance.Name
-					moveTo(fruit.Part.Position + Vector3.new(0, 3, 0), Config.Fruit.Speed)
-					touchPart(fruit.Part)
-					interact(fruit.Instance)
-					task.wait(0.4)
-					if Config.Fruit.Notify and not fruit.Part.Parent then
-						notify("Fruta coletada", fruitName, "apple", 4)
-					end
-				else
-					task.wait(0.5)
-				end
-			else
-				task.wait(0.4)
-			end
-		end
-	end)
-end
-
 local function isWantedFruit(name)
 	if type(name) ~= "string" then
 		return true
@@ -725,33 +741,8 @@ local function buyRandomFruit()
 	return result
 end
 
-local function rollLoop()
-	task.spawn(function()
-		local lastReroll = 0
-		while true do
-			task.wait(1)
-			if Config.Roll.Enabled and not busyAction then
-				if getBeli() >= Config.Roll.MinBeli then
-					local fruit = buyRandomFruit()
-					if fruit and Config.Roll.Notify then
-						notify("Rolagem", "Saiu: " .. fruit, "dice-5", 5)
-					end
-					if fruit and isWantedFruit(fruit) then
-						Config.Roll.Enabled = false
-						notify("Rolagem", "Fruta desejada encontrada: " .. fruit, "party-popper", 8)
-					end
-				end
-			end
-			if Config.Roll.Reroll and (os.clock() - lastReroll) > 6 then
-				lastReroll = os.clock()
-				invoke("BlackbeardReward", "Fruit", "2")
-			end
-		end
-	end)
-end
-
 --=====================================================================
--- 8. REMOTE SPY (para voce coletar os remotes do jogo)
+-- 8. REMOTE SPY
 --=====================================================================
 local spyEnabled = false
 local spyInstalled = false
@@ -765,10 +756,16 @@ local function installRemoteSpy()
 		return false
 	end
 	local ok = pcall(function()
+		local targets = {}
+		for _, remote in pairs(REMOTES) do
+			if remote then
+				targets[remote] = true
+			end
+		end
 		local oldNamecall
 		oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
 			local method = getnamecallmethod()
-			if spyEnabled and (self == CommF or self == CommE) and (method == "InvokeServer" or method == "FireServer") then
+			if spyEnabled and targets[self] and (method == "InvokeServer" or method == "FireServer") then
 				local args = table.pack(...)
 				local parts = {}
 				for i = 1, args.n do
@@ -787,7 +784,7 @@ local function installRemoteSpy()
 end
 
 --=====================================================================
--- 9. ANTI-AFK E UTILITARIOS
+-- 9. UTILITARIOS
 --=====================================================================
 local antiAfkConn
 local function applyAntiAfk()
@@ -824,20 +821,241 @@ local function serverHop()
 	end
 end
 
+local function rejoin()
+	if REMOTES.DoRejoin then
+		fireOn(REMOTES.DoRejoin)
+	else
+		TeleportService:Teleport(game.PlaceId, LP)
+	end
+end
+
 --=====================================================================
--- 10. INTERFACE (WINDUI)
+-- 10. SCHEDULER (todos os recursos em loop, com auto-restart)
+--=====================================================================
+local Loops = {}
+local LoopErrors = {}
+
+local function startLoop(name, body)
+	Loops[name] = body
+	task.spawn(function()
+		while Loops[name] do
+			local ok, err = pcall(body)
+			if not ok then
+				LoopErrors[name] = (LoopErrors[name] or 0) + 1
+				if LoopErrors[name] <= 3 then
+					warn(("[MK4 Hubx] loop '%s' falhou: %s"):format(name, tostring(err)))
+				end
+				task.wait(1)
+			end
+		end
+	end)
+end
+
+-- Magnet: mantem todos os NPCs do raio colados no player
+startLoop("pull", function()
+	if not (Config.Farm.Enabled and Config.Farm.Pull) then
+		task.wait(0.3)
+		return
+	end
+	pullMobs()
+	task.wait(0.05)
+end)
+
+-- Kill Aura independente do auto farm
+startLoop("aura", function()
+	if not Config.Farm.KillAura then
+		task.wait(0.3)
+		return
+	end
+	killAura()
+	task.wait(Config.Farm.FastAttack and Config.Farm.AttackDelay or 0.45)
+end)
+
+startLoop("farm", function()
+	if not Config.Farm.Enabled then
+		task.wait(0.3)
+		return
+	end
+	if not getChar() then
+		task.wait(0.5)
+		return
+	end
+	local filter = Config.Farm.Mode == "Mob especifico" and Config.Farm.Mob or nil
+	local target = nearestMob(Config.Farm.Pull and Config.Farm.PullRadius or Config.Farm.Radius, filter)
+	if target then
+		farmTarget(target, function()
+			return Config.Farm.Enabled
+		end)
+	else
+		task.wait(0.4)
+	end
+end)
+
+startLoop("quest", function()
+	if not (Config.Farm.Enabled and Config.Farm.AutoQuest) then
+		task.wait(0.5)
+		return
+	end
+	startQuest()
+	task.wait(5)
+end)
+
+startLoop("buso", function()
+	if not Config.Farm.AutoBuso then
+		task.wait(1)
+		return
+	end
+	invoke("Buso")
+	task.wait(2)
+end)
+
+startLoop("events", function()
+	local any = false
+	for _, enabled in pairs(Config.Events) do
+		if enabled then
+			any = true
+			break
+		end
+	end
+	if not any then
+		task.wait(0.5)
+		return
+	end
+	local mob, id = findEventTarget()
+	if mob then
+		farmTarget(mob, function()
+			return Config.Events[id] == true
+		end)
+	else
+		task.wait(0.5)
+	end
+end)
+
+startLoop("chest", function()
+	if not Config.Chest.Enabled then
+		task.wait(0.3)
+		return
+	end
+	local chest = nearestChest(Config.Chest.Radius)
+	if chest then
+		collectChest(chest)
+		task.wait(Config.Chest.Delay)
+	else
+		refreshChests(true)
+		task.wait(0.6)
+	end
+end)
+
+startLoop("fruit", function()
+	if not Config.Fruit.Enabled then
+		task.wait(0.4)
+		return
+	end
+	local fruit = nearestFruit()
+	if not fruit then
+		task.wait(0.5)
+		return
+	end
+	local fruitName = fruit.Instance.Name
+	fruitCooldown[fruit.Instance] = os.clock()
+	moveTo(fruit.Part.Position + Vector3.new(0, 3, 0), Config.Fruit.Speed)
+	if firetouchinterest then
+		local hrp = getHRP()
+		if hrp then
+			pcall(function()
+				firetouchinterest(hrp, fruit.Part, 0)
+			end)
+			task.wait(0.05)
+			pcall(function()
+				firetouchinterest(hrp, fruit.Part, 1)
+			end)
+		end
+	else
+		local hrp = getHRP()
+		if hrp then
+			hrp.CFrame = fruit.Part.CFrame
+		end
+	end
+	interact(fruit.Instance)
+	task.wait(0.4)
+	if Config.Fruit.Notify and not fruit.Part.Parent then
+		notify("Fruta coletada", fruitName, "apple", 4)
+	end
+end)
+
+startLoop("roll", function()
+	if not Config.Roll.Enabled then
+		task.wait(1)
+		return
+	end
+	if busyAction then
+		task.wait(0.5)
+		return
+	end
+	if getBeli() < Config.Roll.MinBeli then
+		task.wait(2)
+		return
+	end
+	local fruit = buyRandomFruit()
+	if fruit and Config.Roll.Notify then
+		notify("Rolagem", "Saiu: " .. fruit, "dice-5", 5)
+	end
+	if fruit and isWantedFruit(fruit) then
+		Config.Roll.Enabled = false
+		notify("Rolagem", "Fruta desejada encontrada: " .. fruit, "party-popper", 8)
+	end
+	task.wait(1)
+end)
+
+startLoop("reroll", function()
+	if not Config.Roll.Reroll then
+		task.wait(1)
+		return
+	end
+	invoke("BlackbeardReward", "Fruit", "2")
+	task.wait(6)
+end)
+
+--=====================================================================
+-- 11. TEMA VERMELHO / PRETO
+--=====================================================================
+local MK4_RED = {
+	Name = "MK4 Red",
+	Background = Color3.fromHex("#0b0505"),
+	Accent = Color3.fromHex("#1a0606"),
+	Dialog = Color3.fromHex("#140404"),
+	Outline = Color3.fromHex("#3b0f0f"),
+	Text = Color3.fromHex("#f6e9e9"),
+	Placeholder = Color3.fromHex("#8d6a6a"),
+	Button = Color3.fromHex("#c81e1e"),
+	Icon = Color3.fromHex("#ff4d4d"),
+	Toggle = Color3.fromHex("#e11d1d"),
+	Slider = Color3.fromHex("#ff3b3b"),
+}
+
+pcall(function()
+	WindUI:AddTheme(MK4_RED)
+	WindUI:SetTheme("MK4 Red")
+end)
+
+--=====================================================================
+-- 12. INTERFACE
 --=====================================================================
 local Window = WindUI:CreateWindow({
 	Title = "MK4 Hubx",
 	Icon = "grip",
-	Author = "MK4",
+	Author = "MK4 | Blox Fruits",
 	Folder = "MK4Hubx",
-	Size = UDim2.fromOffset(640, 520),
-	Theme = "Dark",
-	Transparency = 0.15,
-	SideBarWidth = 180,
+	Size = UDim2.fromOffset(660, 540),
+	Theme = "MK4 Red",
+	Transparency = 0.1,
+	SideBarWidth = 185,
 	User = { Enabled = true, Anonymous = true },
 })
+
+if not Window then
+	return warn("[MK4 Hubx] Nao foi possivel criar a janela (outra instancia da WindUI aberta).")
+end
 
 local FarmTab = Window:Tab({ Title = "Farm", Icon = "swords" })
 local EventTab = Window:Tab({ Title = "Events", Icon = "flame" })
@@ -854,9 +1072,61 @@ FarmSection:Toggle({
 	Value = false,
 	Callback = function(state)
 		Config.Farm.Enabled = state
-		if state then
-			notify("Auto Farm", "Ligado", "play", 3)
-		end
+		notify("Auto Farm", state and "Ligado" or "Desligado", state and "play" or "pause", 3)
+	end,
+})
+
+FarmSection:Toggle({
+	Title = "Puxar Mobs (Magnet)",
+	Desc = "Traz todos os NPCs do raio pra perto do player",
+	Value = true,
+	Callback = function(state)
+		Config.Farm.Pull = state
+	end,
+})
+
+FarmSection:Slider({
+	Title = "Raio do magnet",
+	Step = 25,
+	Value = { Min = 50, Max = 3000, Default = 600 },
+	Callback = function(value)
+		Config.Farm.PullRadius = value
+	end,
+})
+
+FarmSection:Slider({
+	Title = "Distancia do agrupamento",
+	Step = 1,
+	Value = { Min = 3, Max = 25, Default = 6 },
+	Callback = function(value)
+		Config.Farm.PullDistance = value
+	end,
+})
+
+FarmSection:Toggle({
+	Title = "Kill Aura",
+	Desc = "Bate em todos os mobs ao redor sem se mover",
+	Value = true,
+	Callback = function(state)
+		Config.Farm.KillAura = state
+	end,
+})
+
+FarmSection:Slider({
+	Title = "Raio da Kill Aura",
+	Step = 5,
+	Value = { Min = 10, Max = 300, Default = 40 },
+	Callback = function(value)
+		Config.Farm.AuraRadius = value
+	end,
+})
+
+FarmSection:Button({
+	Title = "Puxar todos agora",
+	Desc = "Uma vez, sem precisar do auto farm ligado",
+	Callback = function()
+		local pulled = pullMobs()
+		notify("Magnet", ("%d NPCs puxados"):format(pulled), "magnet", 4)
 	end,
 })
 
@@ -889,7 +1159,6 @@ mobDropdown = FarmSection:Dropdown({
 
 FarmSection:Button({
 	Title = "Atualizar lista de mobs",
-	Desc = "Escaneia os mobs ao redor",
 	Callback = function()
 		local names = { "Nenhum" }
 		for _, mob in ipairs(collectMobs()) do
@@ -934,7 +1203,6 @@ FarmSection:Slider({
 
 FarmSection:Toggle({
 	Title = "Fast Attack",
-	Desc = "Usa o delay configurado acima",
 	Value = true,
 	Callback = function(state)
 		Config.Farm.FastAttack = state
@@ -943,7 +1211,7 @@ FarmSection:Toggle({
 
 FarmSection:Toggle({
 	Title = "Auto Buso Haki",
-	Desc = "Ativa o Busoshoku enquanto farma",
+	Desc = "Reinvoca o Busoshoku a cada 2s",
 	Value = false,
 	Callback = function(state)
 		Config.Farm.AutoBuso = state
@@ -954,16 +1222,25 @@ local QuestSection = FarmTab:Section({ Title = "Quest" })
 
 QuestSection:Toggle({
 	Title = "Auto Quest",
-	Desc = "Inicia a quest selecionada quando nao houver alvo",
+	Desc = "Mantem a quest sempre iniciada (loop)",
 	Value = false,
 	Callback = function(state)
 		Config.Farm.AutoQuest = state
 	end,
 })
 
+QuestSection:Toggle({
+	Title = "Usar GetBestQuestNPC",
+	Desc = "Pede ao servidor a melhor quest do nivel",
+	Value = true,
+	Callback = function(state)
+		Config.Farm.UseBestQuest = state
+	end,
+})
+
 QuestSection:Dropdown({
 	Title = "Quest",
-	Desc = "ID usado no StartQuest",
+	Desc = "ID usado no StartQuest (fallback)",
 	Values = {
 		"BanditQuest1",
 		"MonkeyQuest1",
@@ -997,13 +1274,12 @@ QuestSection:Button({
 	Title = "Iniciar quest agora",
 	Callback = function()
 		startQuest()
-		notify("Quest", ("Quest %s iniciada"):format(Config.Farm.QuestId), "check", 4)
+		notify("Quest", "StartQuest enviado", "check", 4)
 	end,
 })
 
 QuestSection:Button({
 	Title = "Abandonar quest",
-	Desc = "Remove a quest atual",
 	Callback = function()
 		invoke("AbandonQuest")
 		notify("Quest", "Quest abandonada", "x", 3)
@@ -1013,8 +1289,8 @@ QuestSection:Button({
 -- ---------------------------- EVENTS ----------------------------
 local EventSection = EventTab:Section({ Title = "Auto Events" })
 EventSection:Paragraph({
-	Title = "Eventos detectados automaticamente",
-	Desc = "O hub procura os mobs do evento no mapa e engaja quando o evento estiver ativo.",
+	Title = "Loop de eventos",
+	Desc = "O hub procura os mobs do evento no mapa e engaja automaticamente enquanto o toggle estiver ligado.",
 })
 
 for _, id in ipairs({ "SeaBeast", "Elite", "Factory", "CursedShip", "GhostShip", "DoughKing", "Darkbeard", "Kitsune" }) do
@@ -1025,6 +1301,9 @@ for _, id in ipairs({ "SeaBeast", "Elite", "Factory", "CursedShip", "GhostShip",
 		Value = false,
 		Callback = function(state)
 			Config.Events[id] = state
+			if state then
+				Config.Farm.EventsEnabled = true
+			end
 		end,
 	})
 end
@@ -1035,18 +1314,17 @@ SummonSection:Button({
 	Title = "Invocar Darkbeard",
 	Desc = "Precisa do Fist of Darkness",
 	Callback = function()
-		fireRemote("Darkbeard")
 		invoke("Darkbeard", "Summon")
-		notify("Darkbeard", "Tentativa de invocacao enviada", "flame", 5)
+		fireRemote("Darkbeard")
+		notify("Darkbeard", "Invocacao enviada", "flame", 5)
 	end,
 })
 
 SummonSection:Button({
 	Title = "Invocar Dough King",
-	Desc = "Precisa dos requisitos do evento",
 	Callback = function()
 		invoke("DoughKing", "Summon")
-		notify("Dough King", "Tentativa de invocacao enviada", "flame", 5)
+		notify("Dough King", "Invocacao enviada", "flame", 5)
 	end,
 })
 
@@ -1055,8 +1333,17 @@ SummonSection:Button({
 	Desc = "Precisa da chave da fabrica",
 	Callback = function()
 		invoke("FactoryRaid", "Start")
-		fireRemote("FactoryRaid")
+		fireOn(REMOTES.Raids, "Factory")
 		notify("Factory", "Tentativa de inicio enviada", "factory", 5)
+	end,
+})
+
+SummonSection:Button({
+	Title = "Iniciar Raid (Remotes.Raids)",
+	Desc = "Usa o RemoteEvent Raids do jogo",
+	Callback = function()
+		local ok = fireOn(REMOTES.Raids)
+		notify("Raids", ok and "Raids:FireServer() enviado" or "Remote Raids nao encontrado", "ship", 5)
 	end,
 })
 
@@ -1081,7 +1368,7 @@ local ChestSection = ChestTab:Section({ Title = "Auto Bau" })
 
 ChestSection:Toggle({
 	Title = "Auto Coletar Baus",
-	Desc = "Voa ate os baus e coleta",
+	Desc = "Loop continuo: voa ate os baus e coleta",
 	Value = false,
 	Callback = function(state)
 		Config.Chest.Enabled = state
@@ -1092,10 +1379,19 @@ ChestSection:Toggle({
 	end,
 })
 
+ChestSection:Toggle({
+	Title = "Usar Remotes.Chest",
+	Desc = "Dispara o remote oficial de bau alem do touch",
+	Value = true,
+	Callback = function(state)
+		Config.Chest.UseRemote = state
+	end,
+})
+
 ChestSection:Slider({
 	Title = "Raio de busca",
 	Step = 10,
-	Value = { Min = 50, Max = 2000, Default = 400 },
+	Value = { Min = 50, Max = 3000, Default = 500 },
 	Callback = function(value)
 		Config.Chest.Radius = value
 	end,
@@ -1139,11 +1435,12 @@ ChestSection:Button({
 	end,
 })
 
+-- ---------------------------- FRUTAS ----------------------------
 local FruitCollect = FruitTab:Section({ Title = "Auto Frutas" })
 
 FruitCollect:Toggle({
 	Title = "Auto Coletar Frutas",
-	Desc = "Pega frutas que caem no chao",
+	Desc = "Loop continuo de coleta",
 	Value = false,
 	Callback = function(state)
 		Config.Fruit.Enabled = state
@@ -1152,7 +1449,6 @@ FruitCollect:Toggle({
 
 FruitCollect:Toggle({
 	Title = "Avisar no canto da tela",
-	Desc = "Mostra o nome da fruta coletada",
 	Value = true,
 	Callback = function(state)
 		Config.Fruit.Notify = state
@@ -1176,12 +1472,11 @@ FruitCollect:Button({
 	end,
 })
 
--- ---------------------------- ROLAGEM ----------------------------
 local RollSection = FruitTab:Section({ Title = "Rolar / Comprar Frutas" })
 
 RollSection:Toggle({
 	Title = "Auto Rolar Frutas (Cousin)",
-	Desc = "Compra fruta aleatoria ate achar uma desejada",
+	Desc = "Loop de compra ate achar uma fruta desejada",
 	Value = false,
 	Callback = function(state)
 		Config.Roll.Enabled = state
@@ -1236,8 +1531,11 @@ RollSection:Dropdown({
 
 RollSection:Button({
 	Title = "Comprar 1 fruta aleatoria agora",
-	Desc = "Custo do vendedor de frutas",
 	Callback = function()
+		-- usa GetFruitData pra tentar mostrar info da fruta do vendedor
+		pcall(function()
+			invokeOn(REMOTES.GetFruitData, "Cousin")
+		end)
 		local fruit = buyRandomFruit()
 		notify("Rolagem", fruit and ("Saiu: " .. fruit) or "Compra nao concluida (Beli insuficiente?)", "dice-5", 5)
 	end,
@@ -1249,6 +1547,15 @@ RollSection:Toggle({
 	Value = false,
 	Callback = function(state)
 		Config.Roll.Reroll = state
+	end,
+})
+
+RollSection:Button({
+	Title = "Testar SpinGacha",
+	Desc = "Dispara RE/SpinGacha (experimental)",
+	Callback = function()
+		local ok = fireOn(REMOTES.SpinGacha)
+		notify("SpinGacha", ok and "Evento enviado" or "SpinGacha nao encontrado", "dice-5", 5)
 	end,
 })
 
@@ -1328,20 +1635,17 @@ local ServerSection = UtilTab:Section({ Title = "Servidor" })
 
 ServerSection:Button({
 	Title = "Server Hop",
-	Desc = "Entra em outro servidor do mesmo mapa",
 	Callback = serverHop,
 })
 
 ServerSection:Button({
 	Title = "Reconectar",
-	Callback = function()
-		TeleportService:Teleport(game.PlaceId, LP)
-	end,
+	Desc = "Usa Remotes.DoRejoin quando disponivel",
+	Callback = rejoin,
 })
 
 ServerSection:Toggle({
 	Title = "Anti-AFK",
-	Desc = "Evita kick por inatividade",
 	Value = true,
 	Callback = function(state)
 		Config.Misc.AntiAfk = state
@@ -1349,11 +1653,34 @@ ServerSection:Toggle({
 	end,
 })
 
+local ThemeSection = UtilTab:Section({ Title = "Tema" })
+
+local themeNames = { "MK4 Red" }
+pcall(function()
+	for name in pairs(WindUI:GetThemes()) do
+		if not table.find(themeNames, name) then
+			themeNames[#themeNames + 1] = name
+		end
+	end
+end)
+
+ThemeSection:Dropdown({
+	Title = "Tema",
+	Desc = "MK4 Red = vermelho / preto",
+	Values = themeNames,
+	Value = "MK4 Red",
+	Callback = function(option)
+		pcall(function()
+			Window:SetTheme(option)
+		end)
+	end,
+})
+
 local DebugSection = UtilTab:Section({ Title = "Debug / Remote Spy" })
 
 DebugSection:Toggle({
 	Title = "Remote Spy",
-	Desc = "Printa CommF_ / CommE no console (F9)",
+	Desc = "Printa os remotes usados no console (F9)",
 	Value = false,
 	Callback = function(state)
 		if state and not installRemoteSpy() then
@@ -1361,18 +1688,33 @@ DebugSection:Toggle({
 		end
 		spyEnabled = state
 		if state then
-			notify("Remote Spy", "Ligado - use o jogo e veja o console (F9)", "terminal", 5)
+			notify("Remote Spy", "Ligado - veja o console (F9)", "terminal", 5)
 		end
 	end,
 })
 
 DebugSection:Button({
-	Title = "Estado do hub",
-	Desc = "Mostra as configuracoes atuais",
+	Title = "Remotes detectados",
+	Desc = "Lista o que o dump confirmou e o que existe agora",
 	Callback = function()
-		print("[MK4 Hubx] Farm:", Config.Farm.Enabled, "Mob:", Config.Farm.Mob)
-		print("[MK4 Hubx] Bau:", Config.Chest.Enabled, "Frutas:", Config.Fruit.Enabled)
-		print("[MK4 Hubx] Rolagem:", Config.Roll.Enabled, "Beli:", getBeli())
+		for name, remote in pairs(REMOTES) do
+			print(("[MK4 Hubx] %s: %s"):format(name, remote and tostring(remote:GetFullName()) or "AUSENTE"))
+		end
+		if LoopErrors and next(LoopErrors) then
+			for name, count in pairs(LoopErrors) do
+				print(("[MK4 Hubx] loop %s: %d erros"):format(name, count))
+			end
+		end
+		notify("MK4 Hubx", "Lista impressa no console (F9)", "terminal", 4)
+	end,
+})
+
+DebugSection:Button({
+	Title = "Estado do hub",
+	Callback = function()
+		print("[MK4 Hubx] Farm:", Config.Farm.Enabled, "Pull:", Config.Farm.Pull, "Aura:", Config.Farm.KillAura)
+		print("[MK4 Hubx] Bau:", Config.Chest.Enabled, "Frutas:", Config.Fruit.Enabled, "Roll:", Config.Roll.Enabled)
+		print("[MK4 Hubx] Beli:", getBeli())
 		notify("MK4 Hubx", "Estado impresso no console (F9)", "terminal", 4)
 	end,
 })
@@ -1381,6 +1723,9 @@ DebugSection:Button({
 	Title = "Descarregar hub",
 	Desc = "Para todos os loops e fecha a interface",
 	Callback = function()
+		for name in pairs(Loops) do
+			Loops[name] = nil
+		end
 		Config.Farm.Enabled = false
 		Config.Chest.Enabled = false
 		Config.Fruit.Enabled = false
@@ -1402,12 +1747,6 @@ DebugSection:Button({
 })
 
 --=====================================================================
--- 11. START
+-- 13. START
 --=====================================================================
-farmLoop()
-eventLoop()
-chestLoop()
-fruitLoop()
-rollLoop()
-
-notify("MK4 Hubx", "Hub carregado. Sem key, bom farm!", "check-check", 6)
+notify("MK4 Hubx", "v2 carregado - tema vermelho, magnet e loops ativos", "check-check", 6)
