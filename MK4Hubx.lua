@@ -5,13 +5,15 @@
    Tema: vermelho / preto (WindUI:AddTheme)
    Tabs: Farm, Events, Bau, Frutas, Utilitarios
 
-   v3:
-   - Ataque de verdade: tweak no CombatFramework (activeController) +
-     Tool:Activate + clique virtual, com metodo selecionavel
-   - Magnet puxa APENAS NPCs hostis (sem ProximityPrompt/ClickDetector,
-     sem lojistas/quest givers/anchorados)
-   - Bau com teleporte instantaneo e espera longa quando o servidor
-     recusa, para nao travar em um bau inalcancavel
+   v4:
+   - Ataque com ClickButton1 (metodo usado pelos hubs de Blox Fruits)
+     + tweak do CombatFramework + Tool:Activate + CommF Attack, e
+     AUTO-DETECCAO: o hub testa cada metodo e trava no que tira vida
+   - Magnet puxa APENAS NPCs hostis (Workspace.Enemies e aceito direto;
+     fora dela exige sem prompt/clique/dialogo e nao ancorado)
+   - Bau identificado como o jogo faz: Part/Model "Chest" com
+     TouchInterest dentro de workspace.Map, touch em 2 tentativas e
+     espera longa quando o servidor recusa
    - Todos os recursos rodam em loops persistentes (scheduler com pcall
      e auto-restart, nada morre silenciosamente)
    - Remotes reais do jogo (dump PlaceId 2753915549):
@@ -111,6 +113,9 @@ local Config = {
 		AttackIncrement = 4,
 		HitboxMagnitude = 150,
 		AutoEquip = true,
+		AutoDetect = true,
+		Verified = false,
+		DetectTries = 0,
 		Pull = true,
 		PullRadius = 600,
 		PullDistance = 6,
@@ -401,63 +406,78 @@ local function facePosition(position)
 	end)
 end
 
+-- Clique do jogo: ClickButton1 e o que os hubs de Blox Fruits usam
+-- (Button1Down/Up puro costuma nao passar pelo input do CombatFramework).
 local function virtualClick()
-	local point = Vector2.new(0, 0)
-	local camera = Workspace.CurrentCamera
 	local ok = pcall(function()
 		VirtualUser:CaptureController()
+		VirtualUser:ClickButton1(Vector2.new(0, 0))
+	end)
+	if ok then
+		return
+	end
+	local camera = Workspace.CurrentCamera
+	ok = pcall(function()
+		VirtualUser:CaptureController()
 		if camera then
-			VirtualUser:Button1Down(point, camera.CFrame)
-			VirtualUser:Button1Up(point, camera.CFrame)
+			VirtualUser:Button1Down(Vector2.new(0, 0), camera.CFrame)
+			VirtualUser:Button1Up(Vector2.new(0, 0), camera.CFrame)
 		else
-			VirtualUser:Button1Down(point)
-			VirtualUser:Button1Up(point)
+			VirtualUser:Button1Down(Vector2.new(0, 0))
+			VirtualUser:Button1Up(Vector2.new(0, 0))
 		end
 	end)
-	if not ok and mouse1click then
-		pcall(mouse1click)
+	if not ok then
+		pcall(function()
+			mouse1click()
+		end)
 	end
 end
 
-local function attack(position)
+local function executeAttack(method, position)
 	ensureWeapon()
 	boostCombat()
 	if position then
 		facePosition(position)
 	end
-
-	local method = Config.Farm.AttackMethod
-	if method == "CommF Attack" then
+	local label = method or Config.Farm.AttackMethod
+	if label == "CommF Attack" then
 		invoke("Attack")
-		return
-	elseif method == "Tool:Activate" then
+	elseif label == "Tool:Activate" then
 		local tool = getWeapon()
 		if tool then
 			pcall(function()
 				tool:Activate()
 			end)
 		end
-		return
-	elseif method == "Clique virtual" then
+	elseif label == "ClickButton1" then
 		virtualClick()
-		return
+	elseif label == "Mouse1click" then
+		if mouse1click then
+			pcall(mouse1click)
+		else
+			virtualClick()
+		end
+	else
+		-- Auto: ativa a arma, manda clique e de vez em quando o CommF Attack
+		local tool = getWeapon()
+		if tool then
+			pcall(function()
+				tool:Activate()
+			end)
+		elseif not warnedNoWeapon then
+			warnedNoWeapon = true
+			notify("MK4 Hubx", "Equipe uma arma/fruta (ou ligue Auto Equip).", "alert-triangle", 6)
+		end
+		virtualClick()
+		if (os.clock() % 1) < 0.25 then
+			invoke("Attack")
+		end
 	end
+end
 
-	-- Auto: ativa a arma e manda clique virtual (o CombatFramework
-	-- interpreta os dois como ataque)
-	local tool = getWeapon()
-	if tool then
-		pcall(function()
-			tool:Activate()
-		end)
-	elseif not warnedNoWeapon then
-		warnedNoWeapon = true
-		notify("MK4 Hubx", "Equipe uma arma/fruta (ou ligue Auto Equip).", "alert-triangle", 6)
-	end
-	virtualClick()
-	if not tool then
-		invoke("Attack")
-	end
+local function attack(position)
+	executeAttack(nil, position)
 end
 
 -- ProximityPrompt: usa o remote Remotes.Prompt quando existir, com
@@ -516,23 +536,25 @@ local function isAttackable(model)
 	if not hum or not hrp or hum.Health <= 0 then
 		return false
 	end
+	-- Tudo que esta em Workspace.Enemies e mob de farm, aceita direto
+	local enemiesFolder = Workspace:FindFirstChild("Enemies")
+	if enemiesFolder and model:IsDescendantOf(enemiesFolder) then
+		return true
+	end
+	-- Fora da pasta Enemies: ignora NPC interativo / ancorado
 	for _, desc in ipairs(model:GetDescendants()) do
 		if desc:IsA("ProximityPrompt") or desc:IsA("ClickDetector") or desc:IsA("Dialog") then
 			return false
 		end
 	end
-	local enemiesFolder = Workspace:FindFirstChild("Enemies")
-	local inEnemies = enemiesFolder ~= nil and model:IsDescendantOf(enemiesFolder)
-	if not inEnemies then
-		local lower = model.Name:lower()
-		for _, blocked in ipairs(NON_ATTACKABLE) do
-			if lower:find(blocked, 1, true) then
-				return false
-			end
-		end
-		if hrp.Anchored then
+	local lower = model.Name:lower()
+	for _, blocked in ipairs(NON_ATTACKABLE) do
+		if lower:find(blocked, 1, true) then
 			return false
 		end
+	end
+	if hrp.Anchored then
+		return false
 	end
 	return true
 end
@@ -604,6 +626,49 @@ local function nearestMob(radius, filterName)
 	return best
 end
 
+-- ---------------------------------------------------------------
+-- Teste de ataque: dispara cada metodo e ve se a vida do mob cai.
+-- Assim o hub descobre sozinho o que funciona no seu executor.
+-- ---------------------------------------------------------------
+local ATTACK_METHODS = { "ClickButton1", "Tool:Activate", "CommF Attack", "Mouse1click" }
+
+local function testAttackMethod(method, mob)
+	mob = mob or nearestMob(Config.Farm.Pull and Config.Farm.PullRadius or Config.Farm.Radius)
+	if not mob then
+		return nil
+	end
+	local before = mob.Humanoid.Health
+	for _ = 1, 8 do
+		if not mob.Model.Parent or mob.Humanoid.Health <= 0 then
+			return true
+		end
+		executeAttack(method, mob.Root.Position)
+		task.wait(0.15)
+		if mob.Humanoid.Health < before then
+			return true
+		end
+	end
+	return false
+end
+
+local function detectAttackMethod()
+	Config.Farm.DetectTries = (Config.Farm.DetectTries or 0) + 1
+	for _, method in ipairs(ATTACK_METHODS) do
+		local result = testAttackMethod(method)
+		if result == nil then
+			notify("Combate", "Nenhum mob atacavel perto para testar", "alert-triangle", 5)
+			return nil
+		elseif result then
+			Config.Farm.AttackMethod = method
+			Config.Farm.Verified = true
+			notify("Combate", "Metodo que da dano: " .. method, "check", 8)
+			return method
+		end
+	end
+	notify("Combate", "Nenhum metodo tirou vida. Equipe uma arma (espada/ fruta) e tente de novo.", "alert-triangle", 8)
+	return nil
+end
+
 local chestCache = {}
 local lastChestScan = 0
 local chestCooldown = {}
@@ -623,27 +688,72 @@ local function isChestName(name)
 		or lower:find("bau", 1, true) ~= nil
 end
 
+-- Bau real do Blox Fruits: Part/Model "Chest" com TouchInterest (ou
+-- prompt) dentro de workspace.Map. Sem isso e so decoracao do mapa.
+local function chestIsReal(instance)
+	return instance:FindFirstChild("TouchInterest") ~= nil
+		or instance:FindFirstChild("TouchTransmitter") ~= nil
+		or instance:FindFirstChildOfClass("ProximityPrompt") ~= nil
+		or instance:FindFirstChildOfClass("ClickDetector") ~= nil
+end
+
 local function scanChests()
 	local found = {}
-	for _, region in ipairs(Workspace:GetChildren()) do
-		if region:IsA("Folder") or region:IsA("Model") then
-			local ok, descendants = pcall(function()
-				return region:GetDescendants()
-			end)
-			if ok then
-				for _, desc in ipairs(descendants) do
-					if isChestName(desc.Name) and (desc:IsA("Model") or desc:IsA("BasePart")) then
-						local part = desc:IsA("BasePart") and desc
-							or desc.PrimaryPart
-							or desc:FindFirstChildWhichIsA("BasePart")
-						if part then
-							found[#found + 1] = { Instance = desc, Part = part }
-						end
-					end
-				end
+	local seen = {}
+
+	local function consider(desc)
+		if seen[desc] or not isChestName(desc.Name) then
+			return
+		end
+		if not (desc:IsA("Model") or desc:IsA("BasePart")) then
+			return
+		end
+		local part = desc:IsA("BasePart") and desc
+			or desc.PrimaryPart
+			or desc:FindFirstChildWhichIsA("BasePart")
+		if not part then
+			return
+		end
+		seen[desc] = true
+		found[#found + 1] = {
+			Instance = desc,
+			Part = part,
+			Real = chestIsReal(desc) or chestIsReal(part),
+		}
+	end
+
+	local function scan(root)
+		local ok, descendants = pcall(function()
+			return root:GetDescendants()
+		end)
+		if not ok then
+			return
+		end
+		for _, desc in ipairs(descendants) do
+			consider(desc)
+		end
+	end
+
+	local map = Workspace:FindFirstChild("Map")
+	if map then
+		scan(map)
+	end
+	for _, child in ipairs(Workspace:GetChildren()) do
+		if child ~= map and child ~= LP.Character then
+			if (child:IsA("Folder") or child:IsA("Model"))
+				and child.Name ~= "Characters"
+				and child.Name ~= "Enemies"
+				and child.Name ~= "Effects" then
+				scan(child)
+			else
+				consider(child)
 			end
 		end
 	end
+
+	table.sort(found, function(a, b)
+		return a.Real and not b.Real
+	end)
 	return found
 end
 
@@ -662,9 +772,18 @@ local function nearestChest(radius)
 		return nil
 	end
 	local best, bestDistance = nil, radius or 400
+	local anyReal = false
+	for _, entry in ipairs(chestCache) do
+		if entry.Real then
+			anyReal = true
+			break
+		end
+	end
 	for _, entry in ipairs(chestCache) do
 		local part = entry.Part
-		if part and part.Parent and part:IsDescendantOf(Workspace) and not onCooldown(chestCooldown, entry.Instance, 8) then
+		if part and part.Parent and part:IsDescendantOf(Workspace)
+			and not onCooldown(chestCooldown, entry.Instance, 8)
+			and (entry.Real or not anyReal) then
 			local distance = (part.Position - hrp.Position).Magnitude
 			if distance < bestDistance then
 				best, bestDistance = entry, distance
@@ -848,22 +967,24 @@ local function collectChest(entry)
 	-- segundos e o player caia no meio do caminho, nunca chegando no bau.
 	if Config.Chest.Instant then
 		pcall(function()
-			hrp.CFrame = CFrame.new(part.Position + Vector3.new(0, 3, 0))
+			hrp.CFrame = part.CFrame
 		end)
-		task.wait(0.05)
+		task.wait(0.1)
 	else
-		moveTo(part.Position + Vector3.new(0, 3, 0), Config.Chest.Speed)
+		moveTo(part.Position + Vector3.new(0, 2, 0), Config.Chest.Speed)
 	end
 
 	if Config.Chest.UseRemote then
 		fireOn(REMOTES.Chest, entry.Instance)
 		fireOn(REMOTES.Chest, part)
 	end
+
+	-- Touch e o metodo oficial: o bau tem TouchInterest
 	if firetouchinterest then
 		pcall(function()
 			firetouchinterest(hrp, part, 0)
 		end)
-		task.wait(0.05)
+		task.wait(0.15)
 		pcall(function()
 			firetouchinterest(hrp, part, 1)
 		end)
@@ -871,10 +992,22 @@ local function collectChest(entry)
 		pcall(function()
 			hrp.CFrame = part.CFrame
 		end)
-		task.wait(0.1)
 	end
 	interact(entry.Instance)
-	task.wait(0.3)
+	task.wait(0.35)
+
+	-- Segunda tentativa: as vezes o primeiro touch nao registra
+	if part.Parent and firetouchinterest then
+		pcall(function()
+			hrp.CFrame = part.CFrame
+			firetouchinterest(hrp, part, 0)
+		end)
+		task.wait(0.15)
+		pcall(function()
+			firetouchinterest(hrp, part, 1)
+		end)
+		task.wait(0.2)
+	end
 
 	-- Se o bau continuou no mapa, o servidor recusou: coloca em espera longa
 	if part.Parent and entry.Instance.Parent then
@@ -1111,6 +1244,10 @@ startLoop("farm", function()
 	if not getChar() then
 		task.wait(0.5)
 		return
+	end
+	-- Descobre sozinho qual metodo de ataque causa dano neste executor
+	if Config.Farm.AutoDetect and not Config.Farm.Verified and (Config.Farm.DetectTries or 0) < 3 then
+		detectAttackMethod()
 	end
 	local filter = Config.Farm.Mode == "Mob especifico" and Config.Farm.Mob or nil
 	local target = nearestMob(Config.Farm.Pull and Config.Farm.PullRadius or Config.Farm.Radius, filter)
@@ -1453,9 +1590,9 @@ FarmSection:Toggle({
 local CombatSection = FarmTab:Section({ Title = "Combate" })
 
 CombatSection:Dropdown({
-	Title = "Metodo de ataque",
-	Desc = "Auto = ativa a arma + clique virtual (mais confiavel)",
-	Values = { "Auto (todos)", "CommF Attack", "Tool:Activate", "Clique virtual" },
+			Title = "Metodo de ataque",
+		Desc = "Auto = ativa a arma + ClickButton1 (mais confiavel no Blox)",
+		Values = { "Auto (todos)", "ClickButton1", "CommF Attack", "Tool:Activate", "Mouse1click" },
 	Value = "Auto (todos)",
 	Callback = function(option)
 		Config.Farm.AttackMethod = option
@@ -1497,6 +1634,26 @@ CombatSection:Toggle({
 	Value = true,
 	Callback = function(state)
 		Config.Farm.AutoEquip = state
+	end,
+})
+
+CombatSection:Toggle({
+	Title = "Detectar ataque automaticamente",
+	Desc = "Testa os metodos e trava no que tira vida do mob",
+	Value = true,
+	Callback = function(state)
+		Config.Farm.AutoDetect = state
+	end,
+})
+
+CombatSection:Button({
+	Title = "Detectar metodo agora",
+	Desc = "Dispara cada metodo e mede o dano no mob mais proximo",
+	Callback = function()
+		Config.Farm.DetectTries = 0
+		task.spawn(function()
+			detectAttackMethod()
+		end)
 	end,
 })
 
@@ -1731,12 +1888,38 @@ ChestSection:Button({
 ChestSection:Button({
 	Title = "Coletar o mais proximo",
 	Callback = function()
+		task.spawn(function()
+			local chest = nearestChest(Config.Chest.Radius)
+			if chest then
+				collectChest(chest)
+			else
+				notify("Auto Bau", "Nenhum bau no raio configurado", "alert-triangle", 4)
+			end
+		end)
+	end,
+})
+
+ChestSection:Button({
+	Title = "Testar coleta de bau",
+	Desc = "Mostra o bau encontrado e se ele sumiu depois do touch",
+	Callback = function()
+		refreshChests(true)
 		local chest = nearestChest(Config.Chest.Radius)
-		if chest then
-			collectChest(chest)
-		else
-			notify("Auto Bau", "Nenhum bau no raio configurado", "alert-triangle", 4)
+		if not chest then
+			notify("Auto Bau", ("Nenhum bau no raio (%d candidatos no mapa)"):format(#chestCache), "alert-triangle", 6)
+			print("[MK4 Hubx] bau: nenhum candidato. cache =", #chestCache)
+			return
 		end
+		task.spawn(function()
+			print("[MK4 Hubx] bau escolhido:", chest.Part:GetFullName())
+			print("[MK4 Hubx] real (TouchInterest/prompt):", tostring(chest.Real))
+			print("[MK4 Hubx] firetouchinterest disponivel:", tostring(firetouchinterest ~= nil))
+			collectChest(chest)
+			task.wait(0.4)
+			local stillThere = chest.Part.Parent ~= nil
+			print("[MK4 Hubx] bau ainda no mapa depois do touch:", tostring(stillThere))
+			notify("Auto Bau", stillThere and "Bau NAO saiu - veja o console (F9)" or "Bau coletado com sucesso", stillThere and "alert-triangle" or "check", 7)
+		end)
 	end,
 })
 
@@ -1916,12 +2099,14 @@ UtilSection:Button({
 UtilSection:Button({
 	Title = "Ir para o mob mais proximo",
 	Callback = function()
-		local mob = nearestMob(Config.Farm.Radius)
-		if mob then
-			moveTo(mob.Root.Position + Vector3.new(0, 3, 0), Config.Farm.Speed)
-		else
-			notify("Teleporte", "Nenhum mob no raio", "alert-triangle", 4)
-		end
+		task.spawn(function()
+			local mob = nearestMob(Config.Farm.Radius)
+			if mob then
+				moveTo(mob.Root.Position + Vector3.new(0, 3, 0), Config.Farm.Speed)
+			else
+				notify("Teleporte", "Nenhum mob no raio", "alert-triangle", 4)
+			end
+		end)
 	end,
 })
 
@@ -2021,7 +2206,7 @@ DebugSection:Button({
 		local tool = getWeapon()
 		print("[MK4 Hubx] arma equipada:", tool and tool.Name or "NENHUMA")
 		print("[MK4 Hubx] CombatFramework:", getCombatController() and "OK (tweak ativo)" or "NAO ENCONTRADO")
-		print("[MK4 Hubx] metodo de ataque:", Config.Farm.AttackMethod)
+		print("[MK4 Hubx] metodo de ataque:", Config.Farm.AttackMethod, "verificado:", tostring(Config.Farm.Verified))
 		print("[MK4 Hubx] executor tem getreg/getfenv:", tostring(getreg ~= nil), tostring(getfenv ~= nil))
 		print("[MK4 Hubx] mobs atacaveis no mapa:", #collectMobs(true))
 		notify("MK4 Hubx", "Diagnostico impresso no console (F9)", "terminal", 5)
