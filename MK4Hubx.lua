@@ -1,29 +1,28 @@
 --[[
 =====================================================================
-   MK4 HUBX v2  |  Blox Fruits  |  WindUI  |  Sem Key
+   MK4 HUBX v5  |  Blox Fruits  |  WindUI  |  Sem Key
 ---------------------------------------------------------------------
    Tema: vermelho / preto (WindUI:AddTheme)
    Tabs: Farm, Events, Bau, Frutas, Utilitarios
 
-   v4:
-   - Ataque com ClickButton1 (metodo usado pelos hubs de Blox Fruits)
-     + tweak do CombatFramework + Tool:Activate + CommF Attack, e
-     AUTO-DETECCAO: o hub testa cada metodo e trava no que tira vida
-   - Magnet puxa APENAS NPCs hostis (Workspace.Enemies e aceito direto;
-     fora dela exige sem prompt/clique/dialogo e nao ancorado)
-   - Bau identificado como o jogo faz: Part/Model "Chest" com
-     TouchInterest dentro de workspace.Map, touch em 2 tentativas e
-     espera longa quando o servidor recusa
-   - Todos os recursos rodam em loops persistentes (scheduler com pcall
-     e auto-restart, nada morre silenciosamente)
-   - Remotes reais do jogo (dump PlaceId 2753915549):
-       Remotes.CommF_ (RemoteFunction)  Remotes.CommE
-       Remotes.Chest                    Remotes.Prompt
-       Remotes.Raids                    Remotes.OnTalkToNPC
-       Remotes.GetBestQuestNPC          Remotes.GetFruitData
-       Modules.Net["RE/SpinGacha"]      Modules.Net["RE/ShopNetwork"]
-       Modules.Net["RE/GachaNetworkRE"] Remotes.SetLocalMovers
-       Remotes.BodyMover                Remotes.DoRejoin
+   v5 (baseado nos dois scripts abertos que voce mandou):
+   - MAGNET REMOVIDO. No lugar entrou a KILL AURA de servidor:
+     Modules.Net["RE/RegisterAttack"] + ["RE/RegisterHit"], que registra
+     dano em todas as partes de TODOS os mobs do raio sem sair do lugar
+     (mesma tecnica do auto farm Axonic).
+   - Auto Quest real por nivel e por mar: tabela de quests com id, index,
+     mob e posicao (StartQuest usa id + index, nao o nivel), do script Axonic.
+   - Bau no padrao do jogo: Chest1/2/3 (Prata/Ouro/Diamante), so baús com
+     CanTouch ativo, TouchInterest, respawn por tipo e filtro de qualidade.
+   - Tambem entraram: SetTeam Pirates, noclip opcional, auto detect de
+     metodo de ataque e loops persistentes com auto-restart.
+
+   Remotes usados:
+     Remotes.CommF_ (StartQuest/Buso/Cousin/Attack)
+     Remotes.CommE, Remotes.Chest, Remotes.Prompt, Remotes.Raids
+     Modules.Net["RE/RegisterAttack"], ["RE/RegisterHit"]
+     Modules.Net["RE/SpinGacha"], ["RE/ShopNetwork"], ["RE/GachaNetworkRE"]
+     Remotes.DoRejoin, Remotes.GetBestQuestNPC, Remotes.GetFruitData
 
    Execucao:
      loadstring(game:HttpGet("SEU_LINK_AQUI"))()
@@ -84,6 +83,13 @@ local REMOTES = {
 	GachaNetwork = getRemote(ModulesNet, "RE/GachaNetworkRE"),
 	ShopNetwork = getRemote(ModulesNet, "RE/ShopNetwork"),
 	ReadPlayerData = getRemote(ModulesNet, "RF/ReadPlayerData"),
+	-- Registro de dano no servidor (kill aura sem se mover)
+	RegisterAttack = getRemote(ModulesNet, "RE/RegisterAttack")
+		or getRemote(ModulesNet, "RegisterAttack")
+		or getRemote(Remotes, "RegisterAttack"),
+	RegisterHit = getRemote(ModulesNet, "RE/RegisterHit")
+		or getRemote(ModulesNet, "RegisterHit")
+		or getRemote(Remotes, "RegisterHit"),
 }
 
 if not REMOTES.CommF then
@@ -116,14 +122,14 @@ local Config = {
 		AutoDetect = true,
 		Verified = false,
 		DetectTries = 0,
-		Pull = true,
-		PullRadius = 600,
-		PullDistance = 6,
+		ServerHit = true,
 		KillAura = true,
-		AuraRadius = 40,
+		AuraRadius = 400,
+		AuraAllParts = true,
+		TeleportToMob = false,
 		AutoQuest = false,
-		UseBestQuest = true,
 		QuestId = "BanditQuest1",
+		QuestIndex = 1,
 		QuestLevel = 1,
 		AutoBuso = false,
 	},
@@ -134,6 +140,8 @@ local Config = {
 		Radius = 500,
 		UseRemote = true,
 		Instant = true,
+		OnlyActive = true,
+		Grade = "Todos",
 	},
 	Fruit = {
 		Enabled = false,
@@ -151,6 +159,7 @@ local Config = {
 	Events = {},
 	Misc = {
 		AntiAfk = true,
+		Noclip = false,
 	},
 }
 
@@ -406,6 +415,10 @@ local function facePosition(position)
 	end)
 end
 
+-- serverHit e definido na secao 5 (depende da lista de mobs); aqui so
+-- declaramos pra poder ser usado pelo executeAttack
+local serverHit
+
 -- Clique do jogo: ClickButton1 e o que os hubs de Blox Fruits usam
 -- (Button1Down/Up puro costuma nao passar pelo input do CombatFramework).
 local function virtualClick()
@@ -441,7 +454,9 @@ local function executeAttack(method, position)
 		facePosition(position)
 	end
 	local label = method or Config.Farm.AttackMethod
-	if label == "CommF Attack" then
+	if label == "RegisterHit" then
+		serverHit(Config.Farm.AuraRadius)
+	elseif label == "CommF Attack" then
 		invoke("Attack")
 	elseif label == "Tool:Activate" then
 		local tool = getWeapon()
@@ -630,10 +645,10 @@ end
 -- Teste de ataque: dispara cada metodo e ve se a vida do mob cai.
 -- Assim o hub descobre sozinho o que funciona no seu executor.
 -- ---------------------------------------------------------------
-local ATTACK_METHODS = { "ClickButton1", "Tool:Activate", "CommF Attack", "Mouse1click" }
+local ATTACK_METHODS = { "RegisterHit", "ClickButton1", "Tool:Activate", "CommF Attack", "Mouse1click" }
 
 local function testAttackMethod(method, mob)
-	mob = mob or nearestMob(Config.Farm.Pull and Config.Farm.PullRadius or Config.Farm.Radius)
+	mob = mob or nearestMob(Config.Farm.Radius)
 	if not mob then
 		return nil
 	end
@@ -688,6 +703,23 @@ local function isChestName(name)
 		or lower:find("bau", 1, true) ~= nil
 end
 
+-- Tipos de bau do jogo (do script Chest Farmer): Chest1 Prata,
+-- Chest2 Ouro, Chest3 Diamante, cada um com seu respawn.
+local CHEST_GRADES = {
+	Chest1 = { label = "Prata", respawn = 180 },
+	Chest2 = { label = "Ouro", respawn = 360 },
+	Chest3 = { label = "Diamante", respawn = 720 },
+}
+
+local function chestGradeOf(name)
+	for key, data in pairs(CHEST_GRADES) do
+		if name:find(key, 1, true) then
+			return data.label, data.respawn
+		end
+	end
+	return "Comum", 180
+end
+
 -- Bau real do Blox Fruits: Part/Model "Chest" com TouchInterest (ou
 -- prompt) dentro de workspace.Map. Sem isso e so decoracao do mapa.
 local function chestIsReal(instance)
@@ -715,10 +747,22 @@ local function scanChests()
 			return
 		end
 		seen[desc] = true
+		-- CanTouch e a fonte de verdade: baú ja coletado fica com
+		-- CanTouch = false e nao deve ser tentado de novo
+		local active = true
+		pcall(function()
+			if part.CanTouch ~= nil then
+				active = part.CanTouch
+			end
+		end)
+		local grade, respawn = chestGradeOf(desc.Name)
 		found[#found + 1] = {
 			Instance = desc,
 			Part = part,
 			Real = chestIsReal(desc) or chestIsReal(part),
+			Active = active,
+			Grade = grade,
+			Respawn = respawn,
 		}
 	end
 
@@ -781,9 +825,12 @@ local function nearestChest(radius)
 	end
 	for _, entry in ipairs(chestCache) do
 		local part = entry.Part
+		local gradeOk = Config.Chest.Grade == "Todos" or entry.Grade == Config.Chest.Grade
+		local activeOk = (not Config.Chest.OnlyActive) or entry.Active ~= false
 		if part and part.Parent and part:IsDescendantOf(Workspace)
 			and not onCooldown(chestCooldown, entry.Instance, 8)
-			and (entry.Real or not anyReal) then
+			and (entry.Real or not anyReal)
+			and gradeOk and activeOk then
 			local distance = (part.Position - hrp.Position).Magnitude
 			if distance < bestDistance then
 				best, bestDistance = entry, distance
@@ -857,38 +904,60 @@ local function nearestFruit()
 end
 
 --=====================================================================
--- 5. COMBATE / FARM
+-- 5. COMBATE / KILL AURA DE SERVIDOR
 --=====================================================================
--- Puxa todos os NPCs do raio para uma roda ao redor do player.
--- NPCs em Blox Fruits costumam ter network ownership do jogador mais
--- proximo, por isso escrever o CFrame replica para o servidor.
-local function pullMobs()
+-- Tecnica do auto farm Axonic: RE/RegisterAttack registra o golpe e
+-- RE/RegisterHit recebe a lista {mob, part} de cada parte de cada mob
+-- dentro do raio. O dano e aplicado pelo servidor, entao da pra matar
+-- todos os NPCs do mapa sem mover o personagem um stud.
+local function buildHitList(radius, onlyName)
 	local hrp = getHRP()
 	if not hrp then
-		return 0
+		return nil, {}
 	end
-	local pulled = 0
-	local ring = Config.Farm.PullDistance
-	local origin = hrp.Position
+	local hits, primary, closest = {}, nil, math.huge
 	for _, mob in ipairs(collectMobs()) do
-		local mhrp = mob.Root
-		local delta = mhrp.Position - origin
-		local distance = delta.Magnitude
-		if distance <= Config.Farm.PullRadius and distance > ring then
-			pulled = pulled + 1
-			local angle = (pulled * 2.399963) % (math.pi * 2)
-			local target = origin
-				+ Vector3.new(math.cos(angle) * ring, 2, math.sin(angle) * ring)
-			pcall(function()
-				mhrp.CFrame = CFrame.new(target, Vector3.new(origin.X, target.Y, origin.Z))
-				mhrp.AssemblyLinearVelocity = Vector3.zero
-			end)
+		local distance = (mob.Root.Position - hrp.Position).Magnitude
+		if distance <= radius and (not onlyName or onlyName == "" or mob.Name == onlyName) then
+			if distance < closest then
+				closest = distance
+				primary = mob.Model:FindFirstChild("Head") or mob.Root
+			end
+			if Config.Farm.AuraAllParts then
+				for _, part in ipairs(mob.Model:GetChildren()) do
+					if part:IsA("BasePart") then
+						hits[#hits + 1] = { mob.Model, part }
+					end
+				end
+			else
+				hits[#hits + 1] = { mob.Model, mob.Root }
+			end
 		end
 	end
-	return pulled
+	return primary, hits
+end
+
+serverHit = function(radius, onlyName)
+	if not (REMOTES.RegisterAttack and REMOTES.RegisterHit) then
+		return false, 0
+	end
+	local primary, hits = buildHitList(radius or Config.Farm.AuraRadius, onlyName)
+	if not primary or #hits == 0 then
+		return true, 0
+	end
+	fireOn(REMOTES.RegisterAttack, 0.0001)
+	fireOn(REMOTES.RegisterHit, primary, hits)
+	return true, #hits
 end
 
 local function killAura()
+	if Config.Farm.ServerHit then
+		local ok, parts = serverHit(Config.Farm.AuraRadius)
+		if ok and parts > 0 then
+			return
+		end
+	end
+	-- fallback quando RegisterHit nao existe: bate no mais proximo
 	local hrp = getHRP()
 	if not hrp then
 		return
@@ -919,7 +988,7 @@ local function farmTarget(target, keepGoing)
 		return Config.Farm.Enabled
 	end
 
-	if not Config.Farm.Pull then
+	if Config.Farm.TeleportToMob then
 		moveTo(mhrp.Position + Vector3.new(0, 3, 0), Config.Farm.Speed)
 	end
 
@@ -928,28 +997,175 @@ local function farmTarget(target, keepGoing)
 		if not hrp then
 			break
 		end
-		if not Config.Farm.Pull and (hrp.Position - mhrp.Position).Magnitude > 14 then
+		if Config.Farm.TeleportToMob and (hrp.Position - mhrp.Position).Magnitude > 14 then
 			hrp.CFrame = CFrame.new(mhrp.Position + Vector3.new(0, 3, 0))
 		end
 		if Config.Farm.AutoBuso and (os.clock() - lastBuso) > 2 then
 			lastBuso = os.clock()
 			invoke("Buso")
 		end
-		attack(mhrp.Position)
+		if Config.Farm.ServerHit then
+			serverHit(Config.Farm.AuraRadius)
+		else
+			attack(mhrp.Position)
+		end
 		task.wait(Config.Farm.FastAttack and Config.Farm.AttackDelay or 0.45)
 	end
 end
 
-local function startQuest()
-	local questId = Config.Farm.QuestId
-	-- GetBestQuestNPC: escolhe a melhor quest pro nivel atual quando existir
-	if Config.Farm.UseBestQuest and REMOTES.GetBestQuestNPC then
-		local best = invokeOn(REMOTES.GetBestQuestNPC)
-		if type(best) == "string" and #best > 0 then
-			questId = best
+--=====================================================================
+-- 5.1 QUESTS (tabela do Axonic: id, index, mob e posicao por nivel)
+--=====================================================================
+local SEA_BY_PLACE = {
+	[2753915549] = "sea1", [85211729168715] = "sea1",
+	[4442272183] = "sea2", [79091703265657] = "sea2",
+	[7449423635] = "sea3", [100117331123089] = "sea3",
+}
+
+local QUESTS = {
+	sea1 = {
+		{ min = 1, max = 9, mob = "Bandit", id = "BanditQuest1", index = 1, position = Vector3.new(1045.96, 27.00, 1560.82) },
+		{ min = 10, max = 14, mob = "Monkey", id = "JungleQuest", index = 1, position = Vector3.new(-1448.51, 67.85, 11.46) },
+		{ min = 15, max = 29, mob = "Gorilla", id = "JungleQuest", index = 2, position = Vector3.new(-1129.88, 40.46, -525.42) },
+		{ min = 30, max = 39, mob = "Pirate", id = "BuggyQuest1", index = 1, position = Vector3.new(-1103.51, 13.75, 3896.09) },
+		{ min = 40, max = 59, mob = "Brute", id = "BuggyQuest1", index = 2, position = Vector3.new(-1140.08, 14.80, 4322.92) },
+		{ min = 60, max = 74, mob = "Desert Bandit", id = "DesertQuest", index = 1, position = Vector3.new(924.79, 6.44, 4481.58) },
+		{ min = 75, max = 89, mob = "Desert Officer", id = "DesertQuest", index = 2, position = Vector3.new(1608.28, 8.61, 4371.00) },
+		{ min = 90, max = 99, mob = "Snow Bandit", id = "SnowQuest", index = 1, position = Vector3.new(1354.34, 87.27, -1393.94) },
+		{ min = 100, max = 119, mob = "Snowman", id = "SnowQuest", index = 2, position = Vector3.new(1201.64, 144.57, -1550.06) },
+		{ min = 120, max = 149, mob = "Chief Petty Officer", id = "MarineQuest2", index = 1, position = Vector3.new(-4881.23, 22.65, 4273.75) },
+		{ min = 150, max = 174, mob = "Sky Bandit", id = "SkyQuest", index = 1, position = Vector3.new(-4953.20, 295.74, -2899.22) },
+		{ min = 175, max = 189, mob = "Dark Master", id = "SkyQuest", index = 2, position = Vector3.new(-5259.84, 391.39, -2229.03) },
+		{ min = 190, max = 209, mob = "Prisoner", id = "PrisonerQuest", index = 1, position = Vector3.new(5098.97, -0.32, 474.23) },
+		{ min = 210, max = 249, mob = "Dangerous Prisoner", id = "PrisonerQuest", index = 2, position = Vector3.new(5654.56, 15.63, 866.29) },
+		{ min = 250, max = 274, mob = "Toga Warrior", id = "ColosseumQuest", index = 1, position = Vector3.new(-1820.21, 51.68, -2740.66) },
+		{ min = 275, max = 299, mob = "Gladiator", id = "ColosseumQuest", index = 2, position = Vector3.new(-1292.83, 56.38, -3339.03) },
+		{ min = 300, max = 324, mob = "Military Soldier", id = "MagmaQuest", index = 1, position = Vector3.new(-5411.16, 11.08, 8454.29) },
+		{ min = 325, max = 374, mob = "Military Spy", id = "MagmaQuest", index = 2, position = Vector3.new(-5802.86, 86.26, 8828.85) },
+		{ min = 375, max = 399, mob = "Fishman Warrior", id = "FishmanQuest", index = 1, position = Vector3.new(60878.30, 18.48, 1543.75) },
+		{ min = 400, max = 449, mob = "Fishman Commando", id = "FishmanQuest", index = 2, position = Vector3.new(61922.63, 18.48, 1493.93) },
+		{ min = 450, max = 474, mob = "God's Guard", id = "SkyExp1Quest", index = 1, position = Vector3.new(-4710.04, 845.27, -1927.30) },
+		{ min = 475, max = 524, mob = "Shanda", id = "SkyExp1Quest", index = 2, position = Vector3.new(-7678.48, 5566.40, -497.21) },
+		{ min = 525, max = 549, mob = "Royal Squad", id = "SkyExp2Quest", index = 1, position = Vector3.new(-7624.25, 5658.13, -1467.35) },
+		{ min = 550, max = 624, mob = "Royal Soldier", id = "SkyExp2Quest", index = 2, position = Vector3.new(-7836.75, 5645.66, -1790.62) },
+		{ min = 625, max = 649, mob = "Galley Pirate", id = "FountainQuest", index = 1, position = Vector3.new(5551.02, 78.90, 3930.41) },
+		{ min = 650, max = math.huge, mob = "Galley Captain", id = "FountainQuest", index = 2, position = Vector3.new(5441.95, 42.50, 4950.09) },
+	},
+	sea2 = {
+		{ min = 700, max = 724, mob = "Raider", id = "Area1Quest", index = 1, position = Vector3.new(-728.32, 52.77, 2345.77) },
+		{ min = 725, max = 774, mob = "Mercenary", id = "Area1Quest", index = 2, position = Vector3.new(-1004.32, 80.15, 1424.61) },
+		{ min = 775, max = 799, mob = "Swan Pirate", id = "Area2Quest", index = 1, position = Vector3.new(1068.66, 137.61, 1322.10) },
+		{ min = 800, max = 874, mob = "Factory Staff", id = "Area2Quest", index = 2, position = Vector3.new(73.07, 81.86, -27.47) },
+		{ min = 875, max = 899, mob = "Marine Lieutenant", id = "MarineQuest3", index = 1, position = Vector3.new(-2821.37, 75.89, -3070.08) },
+		{ min = 900, max = 949, mob = "Marine Captain", id = "MarineQuest3", index = 2, position = Vector3.new(-1861.23, 80.17, -3254.69) },
+		{ min = 950, max = 974, mob = "Zombie", id = "ZombieQuest", index = 1, position = Vector3.new(-5657.77, 78.96, -928.68) },
+		{ min = 975, max = 999, mob = "Vampire", id = "ZombieQuest", index = 2, position = Vector3.new(-6037.66, 32.18, -1340.65) },
+		{ min = 1000, max = 1049, mob = "Snow Trooper", id = "SnowMountainQuest", index = 1, position = Vector3.new(549.14, 427.38, -5563.69) },
+		{ min = 1050, max = 1099, mob = "Winter Warrior", id = "SnowMountainQuest", index = 2, position = Vector3.new(1142.74, 475.63, -5199.41) },
+		{ min = 1100, max = 1124, mob = "Lab Subordinate", id = "IceSideQuest", index = 1, position = Vector3.new(-5707.47, 15.95, -4513.39) },
+		{ min = 1125, max = 1174, mob = "Horned Warrior", id = "IceSideQuest", index = 2, position = Vector3.new(-6341.36, 15.95, -5723.16) },
+		{ min = 1175, max = 1199, mob = "Magma Ninja", id = "FireSideQuest", index = 1, position = Vector3.new(-5449.67, 76.65, -5808.20) },
+		{ min = 1200, max = 1249, mob = "Lava Pirate", id = "FireSideQuest", index = 2, position = Vector3.new(-5213.33, 49.73, -4701.45) },
+		{ min = 1250, max = 1274, mob = "Ship Deckhand", id = "ShipQuest1", index = 1, position = Vector3.new(1206.06, 149.57, 33092.49) },
+		{ min = 1275, max = 1299, mob = "Ship Engineer", id = "ShipQuest1", index = 2, position = Vector3.new(1036.78, 64.28, 33074.14) },
+		{ min = 1300, max = 1324, mob = "Ship Steward", id = "ShipQuest2", index = 1, position = Vector3.new(1006.88, 149.01, 33366.95) },
+		{ min = 1325, max = 1349, mob = "Ship Officer", id = "ShipQuest2", index = 2, position = Vector3.new(1182.53, 204.90, 33445.61) },
+		{ min = 1350, max = 1374, mob = "Arctic Warrior", id = "FrostQuest", index = 1, position = Vector3.new(5966.24, 62.97, -6179.38) },
+		{ min = 1375, max = 1424, mob = "Snow Lurker", id = "FrostQuest", index = 2, position = Vector3.new(5407.07, 69.19, -6880.88) },
+		{ min = 1425, max = 1450, mob = "Sea Soldier", id = "ForgottenQuest", index = 1, position = Vector3.new(-2898.78, 27.01, -9776.41) },
+		{ min = 1450, max = math.huge, mob = "Water Fighter", id = "ForgottenQuest", index = 2, position = Vector3.new(-3309.07, 325.17, -10422.44) },
+	},
+	sea3 = {
+		{ min = 1500, max = 1524, mob = "Pirate Millionaire", id = "PiratePortQuest", index = 1, position = Vector3.new(-246.00, 47.31, 5584.10) },
+		{ min = 1525, max = 1574, mob = "Pistol Billionaire", id = "PiratePortQuest", index = 2, position = Vector3.new(-187.33, 86.24, 6013.51) },
+		{ min = 1575, max = 1599, mob = "Dragon Crew Warrior", id = "DragonCrewQuest", index = 1, position = Vector3.new(7014.84, 196.36, -1024.29) },
+		{ min = 1600, max = 1624, mob = "Dragon Crew Archer", id = "DragonCrewQuest", index = 2, position = Vector3.new(6792.60, 535.42, 454.47) },
+		{ min = 1625, max = 1649, mob = "Hydra Enforcer", id = "VenomCrewQuest", index = 1, position = Vector3.new(4704.02, 1043.86, 679.61) },
+		{ min = 1650, max = 1699, mob = "Venomous Assailant", id = "VenomCrewQuest", index = 2, position = Vector3.new(4731.27, 1090.17, 1078.17) },
+		{ min = 1700, max = 1724, mob = "Marine Commodore", id = "MarineTreeIsland", index = 1, position = Vector3.new(2286.00, 73.13, -7159.80) },
+		{ min = 1725, max = 1774, mob = "Marine Rear Admiral", id = "MarineTreeIsland", index = 2, position = Vector3.new(3656.77, 160.52, -7001.59) },
+		{ min = 1775, max = 1824, mob = "Fishman Raider", id = "DeepForestIsland3", index = 1, position = Vector3.new(-10407.52, 331.76, -8368.51) },
+		{ min = 1825, max = 1849, mob = "Forest Pirate", id = "DeepForestIsland", index = 1, position = Vector3.new(-13274.47, 332.37, -7769.58) },
+		{ min = 1850, max = 1899, mob = "Mythological Pirate", id = "DeepForestIsland", index = 2, position = Vector3.new(-13680.60, 501.08, -6991.18) },
+		{ min = 1900, max = 1924, mob = "Jungle Pirate", id = "DeepForestIsland2", index = 1, position = Vector3.new(-12256.16, 331.73, -10485.83) },
+		{ min = 1925, max = 1974, mob = "Musketeer Pirate", id = "DeepForestIsland2", index = 2, position = Vector3.new(-13457.90, 391.54, -9859.17) },
+		{ min = 1975, max = 1999, mob = "Reborn Skeleton", id = "HauntedQuest1", index = 1, position = Vector3.new(-8763.72, 165.72, 6159.86) },
+		{ min = 2000, max = 2024, mob = "Living Zombie", id = "HauntedQuest1", index = 2, position = Vector3.new(-10144.13, 138.62, 5838.08) },
+		{ min = 2025, max = 2049, mob = "Demonic Soul", id = "HauntedQuest2", index = 1, position = Vector3.new(-9505.87, 172.10, 6158.99) },
+		{ min = 2050, max = 2074, mob = "Posessed Mummy", id = "HauntedQuest2", index = 2, position = Vector3.new(-9582.02, 6.25, 6205.47) },
+		{ min = 2075, max = 2099, mob = "Peanut Scout", id = "NutsIslandQuest", index = 1, position = Vector3.new(-2143.24, 47.72, -10029.99) },
+		{ min = 2100, max = 2124, mob = "Peanut President", id = "NutsIslandQuest", index = 2, position = Vector3.new(-1859.35, 38.10, -10422.42) },
+		{ min = 2125, max = 2149, mob = "Ice Cream Chef", id = "IceCreamIslandQuest", index = 1, position = Vector3.new(-872.24, 65.81, -10919.95) },
+		{ min = 2150, max = 2199, mob = "Ice Cream Commander", id = "IceCreamIslandQuest", index = 2, position = Vector3.new(-558.06, 112.04, -11290.77) },
+		{ min = 2200, max = 2224, mob = "Cookie Crafter", id = "CakeQuest1", index = 1, position = Vector3.new(-2374.13, 37.79, -12125.30) },
+		{ min = 2225, max = 2249, mob = "Cake Guard", id = "CakeQuest1", index = 2, position = Vector3.new(-1598.30, 43.77, -12244.58) },
+		{ min = 2250, max = 2274, mob = "Baking Staff", id = "CakeQuest2", index = 1, position = Vector3.new(-1887.80, 77.61, -12998.35) },
+		{ min = 2275, max = 2299, mob = "Head Baker", id = "CakeQuest2", index = 2, position = Vector3.new(-2216.18, 82.88, -12869.29) },
+		{ min = 2300, max = 2324, mob = "Cocoa Warrior", id = "ChocQuest1", index = 1, position = Vector3.new(-21.55, 80.57, -12352.38) },
+		{ min = 2325, max = 2349, mob = "Chocolate Bar Battler", id = "ChocQuest1", index = 2, position = Vector3.new(582.59, 77.18, -12463.16) },
+		{ min = 2350, max = 2374, mob = "Sweet Thief", id = "ChocQuest2", index = 1, position = Vector3.new(165.18, 76.05, -12600.83) },
+		{ min = 2375, max = 2399, mob = "Candy Rebel", id = "ChocQuest2", index = 2, position = Vector3.new(134.86, 77.24, -12876.54) },
+		{ min = 2400, max = 2449, mob = "Candy Pirate", id = "CandyQuest1", index = 1, position = Vector3.new(-1310.50, 26.01, -14562.40) },
+		{ min = 2450, max = 2474, mob = "Isle Outlaw", id = "TikiQuest1", index = 1, position = Vector3.new(-16303.14, 188.16, -268.92) },
+		{ min = 2475, max = 2524, mob = "Island Boy", id = "TikiQuest1", index = 2, position = Vector3.new(-16303.14, 188.16, -268.92) },
+		{ min = 2525, max = 2549, mob = "Isle Champion", id = "TikiQuest2", index = 2, position = Vector3.new(-16748.46, 94.38, 1129.71) },
+		{ min = 2550, max = 2599, mob = "Serpent Hunter", id = "TikiQuest3", index = 1, position = Vector3.new(-16959.27, 110.61, 1669.60) },
+		{ min = 2600, max = 2624, mob = "Reef Bandit", id = "SubmergedQuest1", index = 1, position = Vector3.new(11106, -2058, 9154) },
+		{ min = 2625, max = 2649, mob = "Coral Pirate", id = "SubmergedQuest1", index = 2, position = Vector3.new(10655, -2018, 9254) },
+		{ min = 2650, max = 2674, mob = "Sea Chanter", id = "SubmergedQuest2", index = 1, position = Vector3.new(10699, -1988, 9995) },
+		{ min = 2675, max = 2699, mob = "Ocean Prophet", id = "SubmergedQuest2", index = 2, position = Vector3.new(11110, -1950, 10128) },
+		{ min = 2700, max = math.huge, mob = "Grand Devotee", id = "SubmergedQuest3", index = 2, position = Vector3.new(9577, -1928, 9936) },
+	},
+}
+
+local function levelOf()
+	return tonumber(getStat("Level")) or 1
+end
+
+local function questForLevel()
+	local sea = SEA_BY_PLACE[game.PlaceId]
+	local list = sea and QUESTS[sea]
+	if not list then
+		return nil
+	end
+	local lvl = levelOf()
+	local fallback = list[1]
+	for _, quest in ipairs(list) do
+		if lvl >= quest.min and lvl <= quest.max then
+			return quest, sea
+		end
+		if lvl > quest.max then
+			fallback = quest
 		end
 	end
-	invoke("StartQuest", questId, Config.Farm.QuestLevel)
+	return fallback, sea
+end
+
+local lastQuestKey = nil
+
+local function questShown()
+	local gui = LP:FindFirstChildOfClass("PlayerGui")
+	local main = gui and gui:FindFirstChild("Main")
+	local frame = main and main:FindFirstChild("Quest")
+	return frame ~= nil and frame.Visible == true
+end
+
+-- StartQuest usa ID + index da quest, nao o nivel
+local function startQuest()
+	local quest = questForLevel()
+	if quest then
+		local key = quest.id .. ":" .. tostring(quest.index)
+		if key ~= lastQuestKey or not questShown() then
+			invoke("StartQuest", quest.id, quest.index)
+			lastQuestKey = key
+		end
+		Config.Farm.QuestId = quest.id
+		Config.Farm.QuestIndex = quest.index
+		Config.Farm.QuestLevel = levelOf()
+		return quest
+	end
+	invoke("StartQuest", Config.Farm.QuestId, Config.Farm.QuestIndex)
+	return nil
 end
 
 local function collectChest(entry)
@@ -1009,9 +1225,12 @@ local function collectChest(entry)
 		task.wait(0.2)
 	end
 
-	-- Se o bau continuou no mapa, o servidor recusou: coloca em espera longa
+	-- Se o bau continuou no mapa, o servidor recusou: espera e tenta outro
 	if part.Parent and entry.Instance.Parent then
 		chestCooldown[entry.Instance] = os.clock() + 20
+		pcall(function()
+			part.CanTouch = false
+		end)
 	end
 	return true
 end
@@ -1216,17 +1435,23 @@ local function startLoop(name, body)
 	end)
 end
 
--- Magnet: mantem todos os NPCs do raio colados no player
-startLoop("pull", function()
-	if not (Config.Farm.Enabled and Config.Farm.Pull) then
-		task.wait(0.3)
+-- Kill Aura: atinge todos os NPCs do raio sem sair do lugar
+startLoop("noclip", function()
+	if not Config.Misc.Noclip then
+		task.wait(0.5)
 		return
 	end
-	pullMobs()
-	task.wait(0.05)
+	local char = LP.Character
+	if char then
+		for _, part in ipairs(char:GetDescendants()) do
+			if part:IsA("BasePart") and part.CanCollide then
+				part.CanCollide = false
+			end
+		end
+	end
+	task.wait(0.1)
 end)
 
--- Kill Aura independente do auto farm
 startLoop("aura", function()
 	if not Config.Farm.KillAura then
 		task.wait(0.3)
@@ -1249,8 +1474,14 @@ startLoop("farm", function()
 	if Config.Farm.AutoDetect and not Config.Farm.Verified and (Config.Farm.DetectTries or 0) < 3 then
 		detectAttackMethod()
 	end
+	-- Se o Auto Quest esta ligado, prioriza o mob da quest do nivel
+	local quest = questForLevel()
 	local filter = Config.Farm.Mode == "Mob especifico" and Config.Farm.Mob or nil
-	local target = nearestMob(Config.Farm.Pull and Config.Farm.PullRadius or Config.Farm.Radius, filter)
+	local target
+	if quest and Config.Farm.AutoQuest and Config.Farm.Mode ~= "Mob especifico" then
+		target = nearestMob(Config.Farm.AuraRadius, quest.mob)
+	end
+	target = target or nearestMob(Config.Farm.Radius, filter)
 	if target then
 		farmTarget(target, function()
 			return Config.Farm.Enabled
@@ -1446,56 +1677,52 @@ FarmSection:Toggle({
 })
 
 FarmSection:Toggle({
-	Title = "Puxar Mobs (Magnet)",
-	Desc = "Traz todos os NPCs do raio pra perto do player",
-	Value = true,
-	Callback = function(state)
-		Config.Farm.Pull = state
-	end,
-})
-
-FarmSection:Slider({
-	Title = "Raio do magnet",
-	Step = 25,
-	Value = { Min = 50, Max = 3000, Default = 600 },
-	Callback = function(value)
-		Config.Farm.PullRadius = value
-	end,
-})
-
-FarmSection:Slider({
-	Title = "Distancia do agrupamento",
-	Step = 1,
-	Value = { Min = 3, Max = 25, Default = 6 },
-	Callback = function(value)
-		Config.Farm.PullDistance = value
-	end,
-})
-
-FarmSection:Toggle({
-	Title = "Kill Aura",
-	Desc = "Bate em todos os mobs ao redor sem se mover",
+	Title = "Kill Aura (servidor)",
+	Desc = "Dano em todos os NPCs do raio sem sair do lugar",
 	Value = true,
 	Callback = function(state)
 		Config.Farm.KillAura = state
 	end,
 })
 
+FarmSection:Toggle({
+	Title = "Usar RegisterHit",
+	Desc = "RE/RegisterAttack + RE/RegisterHit (dano no servidor)",
+	Value = true,
+	Callback = function(state)
+		Config.Farm.ServerHit = state
+	end,
+})
+
+FarmSection:Toggle({
+	Title = "Todas as partes do mob",
+	Desc = "Registra dano em cada BasePart (mais forte)",
+	Value = true,
+	Callback = function(state)
+		Config.Farm.AuraAllParts = state
+	end,
+})
+
 FarmSection:Slider({
 	Title = "Raio da Kill Aura",
-	Step = 5,
-	Value = { Min = 10, Max = 300, Default = 40 },
+	Desc = "Alcance do dano (em studs)",
+	Step = 25,
+	Value = { Min = 50, Max = 3000, Default = 400 },
 	Callback = function(value)
 		Config.Farm.AuraRadius = value
 	end,
 })
 
 FarmSection:Button({
-	Title = "Puxar todos agora",
-	Desc = "Uma vez, sem precisar do auto farm ligado",
+	Title = "Testar Kill Aura agora",
+	Desc = "Dispara o RegisterHit e mostra quantas partes foram enviadas",
 	Callback = function()
-		local pulled = pullMobs()
-		notify("Magnet", ("%d NPCs puxados"):format(pulled), "magnet", 4)
+		local ok, parts = serverHit(Config.Farm.AuraRadius)
+		if not ok then
+			notify("Kill Aura", "RegisterAttack/RegisterHit nao existem neste servidor", "alert-triangle", 7)
+			return
+		end
+		notify("Kill Aura", parts > 0 and ("Dano enviado em %d partes"):format(parts) or "Nenhum mob no raio", parts > 0 and "check" or "alert-triangle", 6)
 	end,
 })
 
@@ -1592,7 +1819,7 @@ local CombatSection = FarmTab:Section({ Title = "Combate" })
 CombatSection:Dropdown({
 			Title = "Metodo de ataque",
 		Desc = "Auto = ativa a arma + ClickButton1 (mais confiavel no Blox)",
-		Values = { "Auto (todos)", "ClickButton1", "CommF Attack", "Tool:Activate", "Mouse1click" },
+		Values = { "Auto (todos)", "RegisterHit", "ClickButton1", "CommF Attack", "Tool:Activate", "Mouse1click" },
 	Value = "Auto (todos)",
 	Callback = function(option)
 		Config.Farm.AttackMethod = option
@@ -1625,6 +1852,15 @@ CombatSection:Slider({
 	Value = { Min = 30, Max = 500, Default = 150 },
 	Callback = function(value)
 		Config.Farm.HitboxMagnitude = value
+	end,
+})
+
+CombatSection:Toggle({
+	Title = "Teleportar ate o mob",
+	Desc = "Desligado = farma parado so com a Kill Aura",
+	Value = false,
+	Callback = function(state)
+		Config.Farm.TeleportToMob = state
 	end,
 })
 
@@ -1682,52 +1918,35 @@ QuestSection:Toggle({
 	end,
 })
 
-QuestSection:Toggle({
-	Title = "Usar GetBestQuestNPC",
-	Desc = "Pede ao servidor a melhor quest do nivel",
-	Value = true,
-	Callback = function(state)
-		Config.Farm.UseBestQuest = state
-	end,
+QuestSection:Paragraph({
+	Title = "Quest automatica por nivel",
+	Desc = "Usa a tabela de quests do mar atual (id + index): o hub escolhe pelo seu nivel e mantem sempre ativa.",
 })
 
-QuestSection:Dropdown({
-	Title = "Quest",
-	Desc = "ID usado no StartQuest (fallback)",
-	Values = {
-		"BanditQuest1",
-		"MonkeyQuest1",
-		"PirateQuest1",
-		"MarineQuest1",
-		"MarineQuest2",
-		"BanditQuest2",
-		"SnowQuest1",
-		"JungleQuest1",
-		"SkyQuest1",
-		"FountainQuest1",
-		"CursedShipQuest1",
-		"KingdomQuest1",
-	},
-	Value = "BanditQuest1",
-	Callback = function(option)
-		Config.Farm.QuestId = option
-	end,
-})
-
-QuestSection:Slider({
-	Title = "Nivel da quest",
-	Step = 1,
-	Value = { Min = 1, Max = 3000, Default = 1 },
-	Callback = function(value)
-		Config.Farm.QuestLevel = value
+QuestSection:Button({
+	Title = "Iniciar quest do meu nivel",
+	Desc = "Mostra qual quest foi escolhida",
+	Callback = function()
+		local quest = startQuest()
+		if quest then
+			notify("Quest", ("%s (%s) - nivel %d"):format(quest.mob, quest.id, Config.Farm.QuestLevel), "check", 6)
+		else
+			notify("Quest", "Mar nao reconhecido, use o botao manual abaixo", "alert-triangle", 5)
+		end
 	end,
 })
 
 QuestSection:Button({
-	Title = "Iniciar quest agora",
+	Title = "Ir para a area da quest",
 	Callback = function()
-		startQuest()
-		notify("Quest", "StartQuest enviado", "check", 4)
+		task.spawn(function()
+			local quest = questForLevel()
+			if quest then
+				moveTo(quest.position + Vector3.new(0, 3, 0), Config.Farm.Speed)
+			else
+				notify("Quest", "Nenhuma quest encontrada para o seu nivel", "alert-triangle", 5)
+			end
+		end)
 	end,
 })
 
@@ -1847,6 +2066,25 @@ ChestSection:Toggle({
 	Value = true,
 	Callback = function(state)
 		Config.Chest.Instant = state
+	end,
+})
+
+ChestSection:Toggle({
+	Title = "So baús ativos (CanTouch)",
+	Desc = "Ignora baú ja coletado que ainda esta no mapa",
+	Value = true,
+	Callback = function(state)
+		Config.Chest.OnlyActive = state
+	end,
+})
+
+ChestSection:Dropdown({
+	Title = "Tipo de bau",
+	Desc = "Chest1 Prata / Chest2 Ouro / Chest3 Diamante",
+	Values = { "Todos", "Prata", "Ouro", "Diamante" },
+	Value = "Todos",
+	Callback = function(option)
+		Config.Chest.Grade = option
 	end,
 })
 
@@ -2143,6 +2381,24 @@ ServerSection:Toggle({
 	end,
 })
 
+ServerSection:Toggle({
+	Title = "Noclip",
+	Desc = "Atravessa paredes (util pra chegar em baús/quests)",
+	Value = false,
+	Callback = function(state)
+		Config.Misc.Noclip = state
+	end,
+})
+
+ServerSection:Button({
+	Title = "Entrar no time Piratas",
+	Desc = "CommF_:InvokeServer(\"SetTeam\", \"Pirates\")",
+	Callback = function()
+		invoke("SetTeam", "Pirates")
+		notify("Time", "SetTeam Pirates enviado", "flag", 4)
+	end,
+})
+
 local ThemeSection = UtilTab:Section({ Title = "Tema" })
 
 local themeNames = { "MK4 Red" }
@@ -2216,7 +2472,8 @@ DebugSection:Button({
 DebugSection:Button({
 	Title = "Estado do hub",
 	Callback = function()
-		print("[MK4 Hubx] Farm:", Config.Farm.Enabled, "Pull:", Config.Farm.Pull, "Aura:", Config.Farm.KillAura)
+		print("[MK4 Hubx] Farm:", Config.Farm.Enabled, "Aura:", Config.Farm.KillAura, "RegisterHit:", Config.Farm.ServerHit)
+		print("[MK4 Hubx] Raio da aura:", Config.Farm.AuraRadius, "mobs no raio:", select(2, serverHit(Config.Farm.AuraRadius)))
 		print("[MK4 Hubx] Bau:", Config.Chest.Enabled, "Frutas:", Config.Fruit.Enabled, "Roll:", Config.Roll.Enabled)
 		print("[MK4 Hubx] Beli:", getBeli())
 		notify("MK4 Hubx", "Estado impresso no console (F9)", "terminal", 4)
