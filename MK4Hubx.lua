@@ -124,7 +124,14 @@ local Config = {
 		DetectTries = 0,
 		ServerHit = true,
 		KillAura = true,
-		AuraRadius = 400,
+		AuraRadius = 250,
+		-- Distancia que o servidor aceita por hit (o Axonic usa 65).
+		-- Acima disso o RegisterHit e ignorado, por isso separamos.
+		AuraRange = 65,
+		-- Pega os NPCs fora do alcance levando o personagem ate eles
+		-- por um tick e voltando pro lugar depois.
+		AuraSweep = true,
+		AuraSweepMax = 6,
 		AuraAllParts = true,
 		TeleportToMob = false,
 		AutoQuest = false,
@@ -361,48 +368,81 @@ local function boostCombat()
 	end)
 end
 
-local MELEE_KEYWORDS = { "sword", "katana", "blade", "cutlass", "saber", "melee", "combat", "claw", "axe", "mace", "trident", "spear", "gun", "fruit" }
+-- Lista de estilos de luta do script Axonic. O servidor so aplica o dano
+-- do RegisterHit quando existe uma melee/fighting style equipada; arma de
+-- fogo, fruta ou nada equipado = hit ignorado (era o bug da aura).
+local MELEE_STYLES = {
+	["combat"] = true, ["dark step"] = true, ["black leg"] = true,
+	["electric"] = true, ["water kung fu"] = true, ["dragon breath"] = true,
+	["superhuman"] = true, ["death step"] = true, ["sharkman karate"] = true,
+	["electric claw"] = true, ["dragon talon"] = true, ["godhuman"] = true,
+	["sanguine art"] = true,
+}
+
+local function isMelee(tool)
+	if not tool or not tool:IsA("Tool") then
+		return false
+	end
+	if MELEE_STYLES[tool.Name:lower()] then
+		return true
+	end
+	local category = ""
+	pcall(function()
+		category = tostring(tool:GetAttribute("WeaponType") or tool.ToolTip or "")
+	end)
+	category = category:lower()
+	return category == "melee" or category == "fighting style"
+end
+
+local function equippedMelee()
+	local char = LP.Character
+	if not char then
+		return nil
+	end
+	-- varre todas as Tools do personagem: as vezes sobra arma antiga junto
+	for _, item in ipairs(char:GetChildren()) do
+		if isMelee(item) then
+			return item
+		end
+	end
+	return nil
+end
 
 local lastEquipTry = 0
-local function ensureWeapon()
-	if not Config.Farm.AutoEquip then
-		return
+-- force = ignora o toggle (usado pelo RegisterHit, que precisa da melee)
+local function ensureWeapon(force)
+	if not (Config.Farm.AutoEquip or force) then
+		return nil
 	end
-	if (os.clock() - lastEquipTry) < 1 then
-		return
+	local current = equippedMelee()
+	if current then
+		return current
+	end
+	if not force and (os.clock() - lastEquipTry) < 0.5 then
+		return nil
 	end
 	lastEquipTry = os.clock()
-	local char, _, hum = getChar()
-	if not char or not hum then
-		return
+	local _, _, hum = getChar()
+	local backpack = LP:FindFirstChildOfClass("Backpack")
+	if not hum or not backpack then
+		return nil
 	end
-	if char:FindFirstChildOfClass("Tool") then
-		return
-	end
-	local backpack = LP:FindFirstChild("Backpack")
-	if not backpack then
-		return
-	end
-	local fallback
+	local choice
 	for _, item in ipairs(backpack:GetChildren()) do
-		if item:IsA("Tool") then
-			fallback = fallback or item
-			local lower = item.Name:lower()
-			for _, word in ipairs(MELEE_KEYWORDS) do
-				if lower:find(word, 1, true) then
-					pcall(function()
-						hum:EquipTool(item)
-					end)
-					return
-				end
+		if isMelee(item) then
+			choice = item
+			if item.Name:lower() == "combat" then
+				break
 			end
 		end
 	end
-	if fallback then
-		pcall(function()
-			hum:EquipTool(fallback)
-		end)
+	if not choice then
+		return nil
 	end
+	pcall(function()
+		hum:EquipTool(choice)
+	end)
+	return choice
 end
 
 local function facePosition(position)
@@ -910,50 +950,154 @@ end
 -- RE/RegisterHit recebe a lista {mob, part} de cada parte de cada mob
 -- dentro do raio. O dano e aplicado pelo servidor, entao da pra matar
 -- todos os NPCs do mapa sem mover o personagem um stud.
+-- Contadores de diagnostico (visiveis em Utilitarios > Estado do hub)
+local dbg = { attacks = 0, parts = 0, reason = "", sweeps = 0, sweepsSent = 0 }
+
+-- onlyName pode ser string (nome do mob, aceita "Bandit [12]") ou o
+-- proprio Model do mob (usado pelo sweep).
+local function matchesOnly(mob, onlyName)
+	if not onlyName or onlyName == "" then
+		return true
+	end
+	if typeof(onlyName) == "Instance" then
+		return mob.Model == onlyName
+	end
+	if mob.Name == onlyName then
+		return true
+	end
+	return mob.Name:sub(1, #onlyName + 2) == onlyName .. " ["
+end
+
 local function buildHitList(radius, onlyName)
 	local hrp = getHRP()
 	if not hrp then
 		return nil, {}
 	end
+	-- o servidor valida a distancia de cada hit: passar disso e desperdicar
+	local limit = math.min(radius or Config.Farm.AuraRadius, Config.Farm.AuraRange)
 	local hits, primary, closest = {}, nil, math.huge
 	for _, mob in ipairs(collectMobs()) do
-		local distance = (mob.Root.Position - hrp.Position).Magnitude
-		if distance <= radius and (not onlyName or onlyName == "" or mob.Name == onlyName) then
-			if distance < closest then
-				closest = distance
-				primary = mob.Model:FindFirstChild("Head") or mob.Root
-			end
-			if Config.Farm.AuraAllParts then
-				for _, part in ipairs(mob.Model:GetChildren()) do
-					if part:IsA("BasePart") then
-						hits[#hits + 1] = { mob.Model, part }
-					end
+		if mob.Humanoid.Health > 0 and matchesOnly(mob, onlyName) then
+			local distance = (mob.Root.Position - hrp.Position).Magnitude
+			if distance <= limit then
+				if distance < closest then
+					closest = distance
+					primary = mob.Model:FindFirstChild("Head") or mob.Root
 				end
-			else
-				hits[#hits + 1] = { mob.Model, mob.Root }
+				if Config.Farm.AuraAllParts then
+					for _, part in ipairs(mob.Model:GetChildren()) do
+						-- limite pra nao estourar o remote com uma lista gigante
+						if part:IsA("BasePart") and #hits < 250 then
+							hits[#hits + 1] = { mob.Model, part }
+						end
+					end
+				else
+					hits[#hits + 1] = { mob.Model, mob.Root }
+				end
 			end
 		end
 	end
 	return primary, hits
 end
 
+-- Retorna ok, partes enviadas, motivo
 serverHit = function(radius, onlyName)
 	if not (REMOTES.RegisterAttack and REMOTES.RegisterHit) then
-		return false, 0
+		dbg.reason = "sem remotes"
+		return false, 0, dbg.reason
+	end
+	-- sem melee equipada o servidor descarta o hit: equipe antes de atirar
+	if not equippedMelee() then
+		ensureWeapon(true)
+		if not equippedMelee() then
+			dbg.reason = "sem melee"
+			return false, 0, dbg.reason
+		end
 	end
 	local primary, hits = buildHitList(radius or Config.Farm.AuraRadius, onlyName)
 	if not primary or #hits == 0 then
-		return true, 0
+		dbg.reason = "sem alvo"
+		return true, 0, dbg.reason
 	end
 	fireOn(REMOTES.RegisterAttack, 0.0001)
 	fireOn(REMOTES.RegisterHit, primary, hits)
-	return true, #hits
+	dbg.attacks = dbg.attacks + 1
+	dbg.parts = dbg.parts + #hits
+	dbg.reason = "ok"
+	return true, #hits, "ok"
 end
 
+-- Mobs dentro do raio da aura mas fora do alcance aceito pelo servidor:
+-- leva o personagem ate cada um por um tick, bate, e volta pro lugar.
+local function sweepFarMobs()
+	local hrp = getHRP()
+	if not hrp then
+		return 0
+	end
+	dbg.sweeps = dbg.sweeps + 1
+	local home = hrp.CFrame
+	local origin = hrp.Position
+	local sent = 0
+	local visited = 0
+	for _, mob in ipairs(collectMobs()) do
+		if visited >= Config.Farm.AuraSweepMax then
+			break
+		end
+		if mob.Humanoid.Health > 0 then
+			local distance = (mob.Root.Position - origin).Magnitude
+			if distance > Config.Farm.AuraRange and distance <= Config.Farm.AuraRadius then
+				visited = visited + 1
+				local current = getHRP()
+				if not current then
+					break
+				end
+				pcall(function()
+					current.CFrame = CFrame.new(mob.Root.Position + Vector3.new(0, 3, 0))
+					-- garante que a validacao de distancia use a posicao nova
+					current.Position = current.CFrame.Position
+				end)
+				local _, count = serverHit(Config.Farm.AuraRange, mob.Model)
+				sent = sent + (count or 0)
+			end
+		end
+	end
+	dbg.sweepsSent = dbg.sweepsSent + sent
+	-- volta pro lugar de onde saiu
+	local back = getHRP()
+	if back then
+		pcall(function()
+			back.CFrame = home
+		end)
+	end
+	return sent
+end
+
+local lastSweep = 0
+local lastNoMelee = 0
 local function killAura()
 	if Config.Farm.ServerHit then
-		local ok, parts = serverHit(Config.Farm.AuraRadius)
+		local ok, parts, reason = serverHit(Config.Farm.AuraRadius)
+		if reason == "sem melee" and (os.clock() - lastNoMelee) > 20 then
+			lastNoMelee = os.clock()
+			notify(
+				"Kill Aura",
+				"Nenhuma espada/estilo de luta equipada. O RegisterHit nao aplica dano sem melee.",
+				"alert-triangle",
+				8
+			)
+		end
 		if ok and parts > 0 then
+			if Config.Farm.AuraSweep and (os.clock() - lastSweep) > 0.4 then
+				lastSweep = os.clock()
+				sweepFarMobs()
+			end
+			return
+		end
+		if ok then
+			if Config.Farm.AuraSweep and (os.clock() - lastSweep) > 0.4 then
+				lastSweep = os.clock()
+				sweepFarMobs()
+			end
 			return
 		end
 	end
@@ -1705,24 +1849,72 @@ FarmSection:Toggle({
 
 FarmSection:Slider({
 	Title = "Raio da Kill Aura",
-	Desc = "Alcance do dano (em studs)",
+	Desc = "Raio onde a aura procura NPCs",
 	Step = 25,
-	Value = { Min = 50, Max = 3000, Default = 400 },
+	Value = { Min = 50, Max = 3000, Default = 250 },
 	Callback = function(value)
 		Config.Farm.AuraRadius = value
 	end,
 })
 
+FarmSection:Slider({
+	Title = "Alcance real do hit",
+	Desc = "Distancia que o servidor aceita (Axonic usa 65). Acima disso o hit e ignorado",
+	Step = 5,
+	Value = { Min = 20, Max = 200, Default = 65 },
+	Callback = function(value)
+		Config.Farm.AuraRange = value
+	end,
+})
+
+FarmSection:Toggle({
+	Title = "Alcancar NPCs fora do alcance",
+	Desc = "Vai ate o NPC por 1 tick, bate e volta pro seu lugar",
+	Value = true,
+	Callback = function(state)
+		Config.Farm.AuraSweep = state
+	end,
+})
+
 FarmSection:Button({
-	Title = "Testar Kill Aura agora",
-	Desc = "Dispara o RegisterHit e mostra quantas partes foram enviadas",
+	Title = "Testar dano da Kill Aura",
+	Desc = "Mede o HP do mob mais proximo antes e depois do hit",
 	Callback = function()
-		local ok, parts = serverHit(Config.Farm.AuraRadius)
-		if not ok then
-			notify("Kill Aura", "RegisterAttack/RegisterHit nao existem neste servidor", "alert-triangle", 7)
-			return
-		end
-		notify("Kill Aura", parts > 0 and ("Dano enviado em %d partes"):format(parts) or "Nenhum mob no raio", parts > 0 and "check" or "alert-triangle", 6)
+		task.spawn(function()
+			ensureWeapon(true)
+			local hrp = getHRP()
+			if not hrp then
+				return
+			end
+			local target, bestDistance = nil, math.huge
+			for _, mob in ipairs(collectMobs()) do
+				local distance = (mob.Root.Position - hrp.Position).Magnitude
+				if mob.Humanoid.Health > 0 and distance < bestDistance then
+					target, bestDistance = mob, distance
+				end
+			end
+			if not target then
+				notify("Kill Aura", "Nenhum mob vivo encontrado", "alert-triangle", 6)
+				return
+			end
+			local tool = equippedMelee()
+			local before = target.Humanoid.Health
+			local ok, parts, reason = serverHit(Config.Farm.AuraRadius)
+			task.wait(1)
+			local after = before
+			pcall(function()
+				after = target.Humanoid.Health
+			end)
+			local dealt = math.max(0, before - after)
+			notify(
+				"Kill Aura",
+				("%s: %.0f -> %.0f (dano %.0f) | %d partes | %s | melee: %s"):format(
+					tostring(target.Name), before, after, dealt, parts or 0, tostring(reason), tool and tool.Name or "nenhuma"
+				),
+				dealt > 0 and "check" or "alert-triangle",
+				10
+			)
+		end)
 	end,
 })
 
@@ -2473,7 +2665,14 @@ DebugSection:Button({
 	Title = "Estado do hub",
 	Callback = function()
 		print("[MK4 Hubx] Farm:", Config.Farm.Enabled, "Aura:", Config.Farm.KillAura, "RegisterHit:", Config.Farm.ServerHit)
-		print("[MK4 Hubx] Raio da aura:", Config.Farm.AuraRadius, "mobs no raio:", select(2, serverHit(Config.Farm.AuraRadius)))
+		local tool = equippedMelee()
+		print("[MK4 Hubx] melee equipada:", tool and tool.Name or "NENHUMA (dano nao aplica)")
+		print("[MK4 Hubx] Raio da aura:", Config.Farm.AuraRadius, "alcance do hit:", Config.Farm.AuraRange)
+		print("[MK4 Hubx] remotes:", REMOTES.RegisterAttack ~= nil, REMOTES.RegisterHit ~= nil)
+		local sentOk, sentParts, sentReason = serverHit(Config.Farm.AuraRadius)
+		print("[MK4 Hubx] envio:", tostring(sentOk), sentParts, sentReason)
+		print("[MK4 Hubx] aura -> ataques:", dbg.attacks, "partes:", dbg.parts, "motivo:", dbg.reason)
+		print("[MK4 Hubx] sweep -> rodadas:", dbg.sweeps, "partes:", dbg.sweepsSent)
 		print("[MK4 Hubx] Bau:", Config.Chest.Enabled, "Frutas:", Config.Fruit.Enabled, "Roll:", Config.Roll.Enabled)
 		print("[MK4 Hubx] Beli:", getBeli())
 		notify("MK4 Hubx", "Estado impresso no console (F9)", "terminal", 4)
