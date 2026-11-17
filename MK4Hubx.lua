@@ -6,10 +6,12 @@
    Tabs: Farm, Events, Bau, Frutas, Utilitarios
 
    v5 (baseado nos dois scripts abertos que voce mandou):
-   - MAGNET REMOVIDO. No lugar entrou a KILL AURA de servidor:
-     Modules.Net["RE/RegisterAttack"] + ["RE/RegisterHit"], que registra
-     dano em todas as partes de TODOS os mobs do raio sem sair do lugar
-     (mesma tecnica do auto farm Axonic).
+   - MAGNET REMOVIDO. No lugar entrou a KILL AURA. v6 (dados reais do
+     MK4Dump): o jogo nao usa mais RE/RegisterHit pra dano de M1, quem
+     manda o hit e o proprio cliente (pacote criptografado). A aura
+     aponta o Mouse pro NPC, registra o golpe (RE/RegisterAttack 0.5 +
+     combo) e ativa a melee; o cliente manda o hit valido sozinho.
+     RE/RegisterHit continua como opcao (arma/estilo antigo).
    - Auto Quest real por nivel e por mar: tabela de quests com id, index,
      mob e posicao (StartQuest usa id + index, nao o nivel), do script Axonic.
    - Bau no padrao do jogo: Chest1/2/3 (Prata/Ouro/Diamante), so baús com
@@ -951,7 +953,7 @@ end
 -- dentro do raio. O dano e aplicado pelo servidor, entao da pra matar
 -- todos os NPCs do mapa sem mover o personagem um stud.
 -- Contadores de diagnostico (visiveis em Utilitarios > Estado do hub)
-local dbg = { attacks = 0, parts = 0, reason = "", sweeps = 0, sweepsSent = 0 }
+local dbg = { attacks = 0, parts = 0, reason = "", sweeps = 0, sweepsSent = 0, m1 = 0 }
 
 -- onlyName pode ser string (nome do mob, aceita "Bandit [12]") ou o
 -- proprio Model do mob (usado pelo sweep).
@@ -998,6 +1000,116 @@ local function buildHitList(radius, onlyName)
 		end
 	end
 	return primary, hits
+end
+
+--=====================================================================
+-- 5.0 AURA COM O M1 DO PROPRIO JOGO (dados reais do MK4Dump)
+--=====================================================================
+-- O que o cliente manda quando voce bate de verdade (dump de 17/11):
+--   Tool.EquipEvent:FireServer(true)
+--   RE/RegisterAttack:FireServer(0.5, 1..4)      -- golpe + combo
+--   Tool.RemoteEvent:FireServer(true) -> (Vector3) -> (false)
+--   ReplicatedStorage.Util.536:FireServer(pacote, id, parte do NPC)
+-- Esse ultimo e o que tira vida, e o pacote muda a cada golpe: nao da
+-- pra forjar. Entao a aura nao forja nada: aponta o Mouse do jogo pro
+-- NPC (Hit/Target), ativa a melee e deixa o cliente mandar o pacote
+-- valido. E o mesmo caminho de um clique manual.
+local mouseTarget = nil
+local mouseHookOk = nil
+local warnedMouseHook = false
+local comboIndex = 0
+
+local function setMouseTarget(part)
+	mouseTarget = part
+end
+
+local function installMouseHook()
+	if mouseHookOk ~= nil then
+		return mouseHookOk
+	end
+	if not hookmetamethod then
+		mouseHookOk = false
+		return false
+	end
+	local okMouse, mouse = pcall(function()
+		return LP:GetMouse()
+	end)
+	if not okMouse or not mouse then
+		mouseHookOk = false
+		return false
+	end
+	local ok = pcall(function()
+		local wrap = newcclosure or function(fn)
+			return fn
+		end
+		local oldIndex
+		oldIndex = hookmetamethod(game, "__index", wrap(function(self, key)
+			if mouseTarget and self == mouse then
+				if key == "Hit" then
+					return CFrame.new(mouseTarget.Position)
+				elseif key == "Target" then
+					return mouseTarget
+				end
+			end
+			return oldIndex(self, key)
+		end))
+	end)
+	mouseHookOk = ok
+	if not ok and not warnedMouseHook then
+		warnedMouseHook = true
+		notify("Kill Aura", "Executor sem hookmetamethod: aura manda so os remotes.", "alert-triangle", 8)
+	end
+	return ok
+end
+
+-- Golpe real em um NPC: aponta o mouse, registra o golpe e ativa a melee.
+local function m1Attack(mob)
+	local hrp = getHRP()
+	if not hrp or not mob or not mob.Model.Parent or mob.Humanoid.Health <= 0 then
+		return false
+	end
+	local tool = equippedMelee() or ensureWeapon(true)
+	if not tool then
+		dbg.reason = "sem melee"
+		return false
+	end
+	local part = mob.Model:FindFirstChild("Head") or mob.Root
+	setMouseTarget(part)
+	facePosition(part.Position)
+	boostCombat()
+	comboIndex = (comboIndex % 4) + 1
+	fireOn(REMOTES.RegisterAttack, 0.5, comboIndex)
+	local remote = tool:FindFirstChild("RemoteEvent")
+	if remote then
+		fireOn(remote, true)
+		fireOn(remote, part.Position)
+		fireOn(remote, false)
+	end
+	pcall(function()
+		tool:Activate()
+	end)
+	virtualClick()
+	dbg.m1 = dbg.m1 + 1
+	dbg.reason = "m1"
+	return true
+end
+
+-- NPC vivo mais perto dentro de um raio
+local function nearestAuraMob(limit)
+	local hrp = getHRP()
+	if not hrp then
+		return nil
+	end
+	local best, bestDistance = nil, limit or Config.Farm.AuraRange
+	for _, mob in ipairs(collectMobs()) do
+		if mob.Humanoid.Health > 0 then
+			local distance = (mob.Root.Position - hrp.Position).Magnitude
+			if distance <= bestDistance then
+				best, bestDistance = mob, distance
+			end
+		end
+	end
+	return best
 end
 
 -- Retorna ok, partes enviadas, motivo
@@ -1056,8 +1168,15 @@ local function sweepFarMobs()
 					-- garante que a validacao de distancia use a posicao nova
 					current.Position = current.CFrame.Position
 				end)
-				local _, count = serverHit(Config.Farm.AuraRange, mob.Model)
-				sent = sent + (count or 0)
+				-- deixa um frame pro servidor ver a posicao nova antes do golpe
+				RunService.Heartbeat:Wait()
+				if m1Attack(mob) then
+					sent = sent + 1
+				end
+				if Config.Farm.ServerHit then
+					local _, count = serverHit(Config.Farm.AuraRange, mob.Model)
+					sent = sent + (count or 0)
+				end
 			end
 		end
 	end
@@ -1075,46 +1194,27 @@ end
 local lastSweep = 0
 local lastNoMelee = 0
 local function killAura()
-	if Config.Farm.ServerHit then
-		local ok, parts, reason = serverHit(Config.Farm.AuraRadius)
-		if reason == "sem melee" and (os.clock() - lastNoMelee) > 20 then
+	installMouseHook()
+	local mob = nearestAuraMob(Config.Farm.AuraRange)
+	if mob then
+		if not m1Attack(mob) and dbg.reason == "sem melee" and (os.clock() - lastNoMelee) > 20 then
 			lastNoMelee = os.clock()
-			notify(
-				"Kill Aura",
-				"Nenhuma espada/estilo de luta equipada. O RegisterHit nao aplica dano sem melee.",
-				"alert-triangle",
-				8
-			)
+			notify("Kill Aura", "Nenhuma melee equipada. Ligue o Auto Equip ou equipe uma espada/estilo.", "alert-triangle", 8)
 		end
-		if ok and parts > 0 then
-			if Config.Farm.AuraSweep and (os.clock() - lastSweep) > 0.4 then
-				lastSweep = os.clock()
-				sweepFarMobs()
-			end
-			return
+		if Config.Farm.ServerHit then
+			serverHit(Config.Farm.AuraRange, mob.Model)
 		end
-		if ok then
-			if Config.Farm.AuraSweep and (os.clock() - lastSweep) > 0.4 then
-				lastSweep = os.clock()
-				sweepFarMobs()
-			end
-			return
-		end
-	end
-	-- fallback quando RegisterHit nao existe: bate no mais proximo
-	local hrp = getHRP()
-	if not hrp then
 		return
 	end
-	local best, bestDistance = nil, Config.Farm.AuraRadius
-	for _, mob in ipairs(collectMobs()) do
-		local distance = (mob.Root.Position - hrp.Position).Magnitude
-		if distance <= bestDistance and mob.Humanoid.Health > 0 then
-			best, bestDistance = mob, distance
-		end
+	-- Nada dentro do alcance que o servidor aceita: vai ate o NPC, bate e volta
+	if Config.Farm.AuraSweep and (os.clock() - lastSweep) > 0.4 then
+		lastSweep = os.clock()
+		sweepFarMobs()
+		return
 	end
-	if best then
-		attack(best.Root.Position)
+	-- Ultimo recurso: RegisterHit em tudo que esta no raio
+	if Config.Farm.ServerHit then
+		serverHit(Config.Farm.AuraRadius)
 	end
 end
 
@@ -1148,10 +1248,9 @@ local function farmTarget(target, keepGoing)
 			lastBuso = os.clock()
 			invoke("Buso")
 		end
+		m1Attack(target)
 		if Config.Farm.ServerHit then
-			serverHit(Config.Farm.AuraRadius)
-		else
-			attack(mhrp.Position)
+			serverHit(Config.Farm.AuraRange, mob)
 		end
 		task.wait(Config.Farm.FastAttack and Config.Farm.AttackDelay or 0.45)
 	end
@@ -1821,17 +1920,20 @@ FarmSection:Toggle({
 })
 
 FarmSection:Toggle({
-	Title = "Kill Aura (servidor)",
-	Desc = "Dano em todos os NPCs do raio sem sair do lugar",
+	Title = "Kill Aura",
+	Desc = "Bate nos NPCs do raio sem sair do lugar (M1 real do jogo)",
 	Value = true,
 	Callback = function(state)
 		Config.Farm.KillAura = state
+		if not state then
+			setMouseTarget(nil)
+		end
 	end,
 })
 
 FarmSection:Toggle({
-	Title = "Usar RegisterHit",
-	Desc = "RE/RegisterAttack + RE/RegisterHit (dano no servidor)",
+	Title = "Tambem mandar RegisterHit",
+	Desc = "RE/RegisterAttack + RE/RegisterHit (o jogo novo ignora no M1)",
 	Value = true,
 	Callback = function(state)
 		Config.Farm.ServerHit = state
@@ -1899,8 +2001,21 @@ FarmSection:Button({
 			end
 			local tool = equippedMelee()
 			local before = target.Humanoid.Health
-			local ok, parts, reason = serverHit(Config.Farm.AuraRadius)
-			task.wait(1)
+			local parts, reason = 0, "m1"
+			for _ = 1, 4 do
+				if m1Attack(target) then
+					parts = parts + 1
+				end
+				if Config.Farm.ServerHit then
+					local _, hitParts = serverHit(Config.Farm.AuraRange, target.Model)
+					parts = parts + (hitParts or 0)
+				end
+				task.wait(0.15)
+				if target.Humanoid.Health < before then
+					break
+				end
+			end
+			task.wait(0.6)
 			local after = before
 			pcall(function()
 				after = target.Humanoid.Health
@@ -2671,7 +2786,8 @@ DebugSection:Button({
 		print("[MK4 Hubx] remotes:", REMOTES.RegisterAttack ~= nil, REMOTES.RegisterHit ~= nil)
 		local sentOk, sentParts, sentReason = serverHit(Config.Farm.AuraRadius)
 		print("[MK4 Hubx] envio:", tostring(sentOk), sentParts, sentReason)
-		print("[MK4 Hubx] aura -> ataques:", dbg.attacks, "partes:", dbg.parts, "motivo:", dbg.reason)
+		print("[MK4 Hubx] aura -> m1:", dbg.m1, "registerHit:", dbg.attacks, "partes:", dbg.parts, "motivo:", dbg.reason)
+		print("[MK4 Hubx] mouse hook (aura m1):", tostring(mouseHookOk))
 		print("[MK4 Hubx] sweep -> rodadas:", dbg.sweeps, "partes:", dbg.sweepsSent)
 		print("[MK4 Hubx] Bau:", Config.Chest.Enabled, "Frutas:", Config.Fruit.Enabled, "Roll:", Config.Roll.Enabled)
 		print("[MK4 Hubx] Beli:", getBeli())
