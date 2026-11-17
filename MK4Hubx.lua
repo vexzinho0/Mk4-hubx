@@ -5,7 +5,12 @@
    Tema: vermelho / preto (WindUI:AddTheme)
    Tabs: Farm, Events, Bau, Frutas, Utilitarios
 
-   v5 (baseado nos dois scripts abertos que voce mandou):
+   v7 (dados reais do MK4Dump + scripts abertos de 2026): o dano nao sai
+     mais por RE/RegisterHit. O cliente manda RE/RegisterAttack e um pacote
+     criptografado (ReplicatedStorage.Util.<id>) gerado pelo CombatFramework.
+     A kill aura/farm agora chamam o golpe do proprio jogo
+     (activeController:attack()) com o Mouse apontado pro NPC, e um hook
+     conta os hits reais pra voce ver no diagnostico se o dano saiu.
    - MAGNET REMOVIDO. No lugar entrou a KILL AURA. v6 (dados reais do
      MK4Dump): o jogo nao usa mais RE/RegisterHit pra dano de M1, quem
      manda o hit e o proprio cliente (pacote criptografado). A aura
@@ -316,9 +321,15 @@ end
 -- ataque e o CombatFramework (PlayerScripts). Alem de ativar a arma,
 -- mexemos no activeController e mandamos clique virtual.
 local combatController = nil
+local combatLib = nil
 local lastCombatLookup = 0
 
 local function getCombatController()
+	-- O lib do combate guarda o activeController: pegando o lib o controller
+	-- se renova sozinho quando o personagem respawna.
+	if combatLib and combatLib.activeController then
+		return combatLib.activeController
+	end
 	if combatController and combatController.Parent ~= nil then
 		return combatController
 	end
@@ -326,6 +337,39 @@ local function getCombatController()
 		return combatController
 	end
 	lastCombatLookup = os.clock()
+	-- Caminho direto, igual aos scripts abertos que funcionam hoje:
+	-- getupvalues(require(PlayerScripts.CombatFramework))[2].activeController
+	do
+		local ok, lib = pcall(function()
+			local scripts = LP:FindFirstChild("PlayerScripts")
+			local module = scripts and scripts:FindFirstChild("CombatFramework")
+			module = module or ReplicatedStorage:FindFirstChild("CombatFramework")
+			if not module or not module:IsA("ModuleScript") then
+				return nil
+			end
+			local required = require(module)
+			if type(required) == "table" then
+				if required.activeController then
+					return required
+				end
+				for _, value in pairs(required) do
+					if type(value) == "table" and value.activeController then
+						return value
+					end
+				end
+				return nil
+			end
+			if type(required) ~= "function" or not debug or not debug.getupvalues then
+				return nil
+			end
+			local list = debug.getupvalues(required)
+			return type(list) == "table" and list[2] or nil
+		end)
+		if ok and type(lib) == "table" and lib.activeController then
+			combatLib = lib
+			return lib.activeController
+		end
+	end
 	if not getreg or not getfenv or not debug or not debug.getupvalues then
 		return nil
 	end
@@ -457,9 +501,10 @@ local function facePosition(position)
 	end)
 end
 
--- serverHit e definido na secao 5 (depende da lista de mobs); aqui so
--- declaramos pra poder ser usado pelo executeAttack
+-- serverHit/swingReal sao definidos na secao 5 (dependem da lista de
+-- mobs); aqui so declaramos pra poder usar no executeAttack
 local serverHit
+local swingReal
 
 -- Clique do jogo: ClickButton1 e o que os hubs de Blox Fruits usam
 -- (Button1Down/Up puro costuma nao passar pelo input do CombatFramework).
@@ -496,7 +541,11 @@ local function executeAttack(method, position)
 		facePosition(position)
 	end
 	local label = method or Config.Farm.AttackMethod
-	if label == "RegisterHit" then
+	if label == "CombatFramework" then
+		if swingReal then
+			swingReal()
+		end
+	elseif label == "RegisterHit" then
 		serverHit(Config.Farm.AuraRadius)
 	elseif label == "CommF Attack" then
 		invoke("Attack")
@@ -516,7 +565,9 @@ local function executeAttack(method, position)
 			virtualClick()
 		end
 	else
-		-- Auto: ativa a arma, manda clique e de vez em quando o CommF Attack
+		-- Auto: o caminho do jogo primeiro (o CombatFramework e quem manda o
+		-- pacote de dano real); input/remotes ficam de reforco.
+		local swung = swingReal and swingReal()
 		local tool = getWeapon()
 		if tool then
 			pcall(function()
@@ -526,7 +577,9 @@ local function executeAttack(method, position)
 			warnedNoWeapon = true
 			notify("MK4 Hubx", "Equipe uma arma/fruta (ou ligue Auto Equip).", "alert-triangle", 6)
 		end
-		virtualClick()
+		if not swung then
+			virtualClick()
+		end
 		if (os.clock() % 1) < 0.25 then
 			invoke("Attack")
 		end
@@ -671,7 +724,10 @@ local function nearestMob(radius, filterName)
 	for _, mob in ipairs(collectMobs()) do
 		local match = true
 		if filterName and filterName ~= "" then
-			match = mob.Name:lower() == filterName:lower()
+			local f = filterName:lower()
+			local name = mob.Name:lower()
+			-- o jogo nomeia os mobs "Bandit" / "Bandit [12]" / "Bandit2"
+			match = name == f or name:sub(1, #f + 1) == f .. " " or name:sub(1, #f) == f and tonumber(name:sub(#f + 1)) ~= nil
 		end
 		if match then
 			local distance = (mob.Root.Position - hrp.Position).Magnitude
@@ -687,7 +743,7 @@ end
 -- Teste de ataque: dispara cada metodo e ve se a vida do mob cai.
 -- Assim o hub descobre sozinho o que funciona no seu executor.
 -- ---------------------------------------------------------------
-local ATTACK_METHODS = { "RegisterHit", "ClickButton1", "Tool:Activate", "CommF Attack", "Mouse1click" }
+local ATTACK_METHODS = { "CombatFramework", "RegisterHit", "ClickButton1", "Tool:Activate", "CommF Attack", "Mouse1click" }
 
 local function testAttackMethod(method, mob)
 	mob = mob or nearestMob(Config.Farm.Radius)
@@ -953,7 +1009,7 @@ end
 -- dentro do raio. O dano e aplicado pelo servidor, entao da pra matar
 -- todos os NPCs do mapa sem mover o personagem um stud.
 -- Contadores de diagnostico (visiveis em Utilitarios > Estado do hub)
-local dbg = { attacks = 0, parts = 0, reason = "", sweeps = 0, sweepsSent = 0, m1 = 0 }
+local dbg = { attacks = 0, parts = 0, reason = "", sweeps = 0, sweepsSent = 0, m1 = 0, hits = 0, swings = 0, lastHit = 0 }
 
 -- onlyName pode ser string (nome do mob, aceita "Bandit [12]") ou o
 -- proprio Model do mob (usado pelo sweep).
@@ -1016,6 +1072,7 @@ end
 -- valido. E o mesmo caminho de um clique manual.
 local mouseTarget = nil
 local mouseHookOk = nil
+local hitHookOk = nil
 local warnedMouseHook = false
 local comboIndex = 0
 
@@ -1062,7 +1119,76 @@ local function installMouseHook()
 	return ok
 end
 
--- Golpe real em um NPC: aponta o mouse, registra o golpe e ativa a melee.
+-- Golpe de verdade pelo CombatFramework do cliente. E o unico caminho que
+-- gera o pacote de dano que o servidor aceita hoje (Util.<id>):
+--   getupvalues(require(PlayerScripts.CombatFramework))[2].activeController:attack()
+-- Os hubs abertos atuais (FastAttack, Avka24, HarashimaX) batem assim.
+swingReal = function()
+	local controller = getCombatController()
+	if not controller then
+		return false
+	end
+	pcall(function()
+		controller.timeToNextAttack = -(math.huge ^ math.huge ^ math.huge)
+		controller.attacking = false
+		controller.blocking = false
+		controller.focusStart = 0
+		controller.increment = Config.Farm.AttackIncrement
+		controller.hitboxMagnitude = Config.Farm.HitboxMagnitude
+		if controller.humanoid then
+			controller.humanoid.AutoRotate = true
+		end
+	end)
+	local ok = pcall(function()
+		controller:attack()
+	end)
+	if ok then
+		dbg.swings = dbg.swings + 1
+	end
+	return ok
+end
+
+-- Conta os hits REAIS que o cliente manda depois do golpe (o pacote mora em
+-- ReplicatedStorage.Util.<id>). Se dbg.hits sobe, o dano saiu; se fica
+-- parado, o golpe nao chegou a ser validado pelo jogo.
+local function installHitHook()
+	if hitHookOk ~= nil then
+		return hitHookOk
+	end
+	if not hookmetamethod or not getnamecallmethod then
+		hitHookOk = false
+		return false
+	end
+	local ok = pcall(function()
+		local wrap = newcclosure or function(fn)
+			return fn
+		end
+		local oldNamecall
+		oldNamecall = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+			if getnamecallmethod() == "FireServer" then
+				local nameOk, isHitRemote = pcall(function()
+					local parent = self.Parent
+					return parent ~= nil and (parent.Name == "Util" or self.Name == "RE/RegisterHit")
+				end)
+				if nameOk and isHitRemote then
+					for _, arg in ipairs({ ... }) do
+						if typeof(arg) == "Instance" then
+							dbg.hits = dbg.hits + 1
+							dbg.lastHit = os.clock()
+							break
+						end
+					end
+				end
+			end
+			return oldNamecall(self, ...)
+		end))
+	end)
+	hitHookOk = ok
+	return ok
+end
+
+-- Golpe real em um NPC: aponta o mouse, vira o personagem e chama o ataque
+-- do CombatFramework (com input/remotes de reserva).
 local function m1Attack(mob)
 	local hrp = getHRP()
 	if not hrp or not mob or not mob.Model.Parent or mob.Humanoid.Health <= 0 then
@@ -1075,8 +1201,15 @@ local function m1Attack(mob)
 	end
 	local part = mob.Model:FindFirstChild("Head") or mob.Root
 	setMouseTarget(part)
+	-- o hitbox do M1 nasce na frente do personagem: virar e obrigatorio
 	facePosition(part.Position)
 	boostCombat()
+	dbg.m1 = dbg.m1 + 1
+	if swingReal() then
+		dbg.reason = "combatframework"
+		return true
+	end
+	-- Sem CombatFramework acessivel: caminho antigo (input + remotes)
 	comboIndex = (comboIndex % 4) + 1
 	fireOn(REMOTES.RegisterAttack, 0.5, comboIndex)
 	local remote = tool:FindFirstChild("RemoteEvent")
@@ -1089,8 +1222,7 @@ local function m1Attack(mob)
 		tool:Activate()
 	end)
 	virtualClick()
-	dbg.m1 = dbg.m1 + 1
-	dbg.reason = "m1"
+	dbg.reason = "input"
 	return true
 end
 
@@ -1110,6 +1242,49 @@ local function nearestAuraMob(limit)
 		end
 	end
 	return best
+end
+
+-- Mede dano de verdade: bate 10x no NPC mais perto e compara o HP.
+-- Imprime tambem os hits que o cliente mandou (prova de que o pacote saiu).
+local function damageProbe()
+	installMouseHook()
+	installHitHook()
+	local mob = nearestAuraMob(Config.Farm.AuraRadius) or nearestMob(Config.Farm.Radius)
+	if not mob then
+		notify("Motor de dano", "Nenhum NPC vivo por perto. Va ate um mob e teste de novo.", "alert-triangle", 7)
+		return false
+	end
+	local tool = equippedMelee() or ensureWeapon(true)
+	local controller = getCombatController()
+	local before = mob.Humanoid.Health
+	local hitsBefore, swingsBefore = dbg.hits, dbg.swings
+	for _ = 1, 10 do
+		if not mob.Model.Parent or mob.Humanoid.Health <= 0 then
+			break
+		end
+		m1Attack(mob)
+		task.wait(0.12)
+	end
+	task.wait(0.35)
+	local after = before
+	pcall(function()
+		after = mob.Humanoid.Health
+	end)
+	local dealt = math.max(0, before - after)
+	print(("[MK4 Hubx] NPC %s: %.0f -> %.0f (dano %.0f)"):format(mob.Name, before, after, dealt))
+	print(("[MK4 Hubx] golpes: %d | hits que o cliente mandou: %d"):format(dbg.swings - swingsBefore, dbg.hits - hitsBefore))
+	print(("[MK4 Hubx] melee: %s | CombatFramework: %s | mouse hook: %s"):format(
+		tool and tool.Name or "NENHUMA",
+		controller and "OK" or "NAO ACHADO",
+		tostring(mouseHookOk)
+	))
+	notify(
+		"Motor de dano",
+		("%s: %s (dano %.0f, hits %d)"):format(mob.Name, dealt > 0 and "FUNCIONOU" or "nao tirou vida", dealt, dbg.hits - hitsBefore),
+		dealt > 0 and "check" or "alert-triangle",
+		10
+	)
+	return dealt > 0
 end
 
 -- Retorna ok, partes enviadas, motivo
@@ -1195,7 +1370,10 @@ local lastSweep = 0
 local lastNoMelee = 0
 local function killAura()
 	installMouseHook()
-	local mob = nearestAuraMob(Config.Farm.AuraRange)
+	installHitHook()
+	-- so mira no que o golpe do cliente alcanca (hitbox x alcance do servidor)
+	local reach = math.min(Config.Farm.AuraRange, Config.Farm.HitboxMagnitude or 60)
+	local mob = nearestAuraMob(reach)
 	if mob then
 		if not m1Attack(mob) and dbg.reason == "sem melee" and (os.clock() - lastNoMelee) > 20 then
 			lastNoMelee = os.clock()
@@ -1219,6 +1397,8 @@ local function killAura()
 end
 
 -- keepGoing: funcao que decide se o combate continua
+-- O farm de verdade precisa CHEGAR no mob: o M1 nasce no personagem, entao
+-- longe do alvo nao existe dano nenhum. Alterna entre andar ate ele e bater.
 local function farmTarget(target, keepGoing)
 	if not target then
 		return
@@ -1231,18 +1411,27 @@ local function farmTarget(target, keepGoing)
 	local active = keepGoing or function()
 		return Config.Farm.Enabled
 	end
+	-- distancia em que o golpe encosta: o hitbox vai de ~30 a ~150 studs
+	local reach = math.clamp((Config.Farm.HitboxMagnitude or 60) * 0.35, 8, 45)
+	installHitHook()
 
-	if Config.Farm.TeleportToMob then
-		moveTo(mhrp.Position + Vector3.new(0, 3, 0), Config.Farm.Speed)
-	end
-
-	while active() and mob.Parent and mhum.Health > 0 and (os.clock() - started) < 8 do
+	while active() and mob.Parent and mhum.Health > 0 and (os.clock() - started) < 25 do
 		local hrp = getHRP()
 		if not hrp then
 			break
 		end
-		if Config.Farm.TeleportToMob and (hrp.Position - mhrp.Position).Magnitude > 14 then
-			hrp.CFrame = CFrame.new(mhrp.Position + Vector3.new(0, 3, 0))
+		local distance = (mhrp.Position - hrp.Position).Magnitude
+		if distance > reach then
+			if Config.Farm.TeleportToMob or distance > 400 then
+				pcall(function()
+					hrp.CFrame = mhrp.CFrame * CFrame.new(0, 2, 3)
+				end)
+				task.wait(0.1)
+			else
+				-- tween na direcao do mob (bloqueia ate chegar, ~1s)
+				local goal = mhrp.Position + (hrp.Position - mhrp.Position).Unit * reach * 0.6
+				moveTo(goal + Vector3.new(0, 2, 0), Config.Farm.Speed)
+			end
 		end
 		if Config.Farm.AutoBuso and (os.clock() - lastBuso) > 2 then
 			lastBuso = os.clock()
@@ -1725,6 +1914,15 @@ startLoop("farm", function()
 		target = nearestMob(Config.Farm.AuraRadius, quest.mob)
 	end
 	target = target or nearestMob(Config.Farm.Radius, filter)
+	if not target and quest and Config.Farm.AutoQuest and Config.Farm.Mode ~= "Mob especifico" then
+		-- Nenhum mob do nivel por perto: vai pra area da quest e espera o spawn
+		if Config.Farm.QuestPos ~= quest.position then
+			Config.Farm.QuestPos = quest.position
+			moveTo(quest.position + Vector3.new(0, 3, 0), Config.Farm.Speed)
+		end
+		task.wait(0.2)
+		return
+	end
 	if target then
 		farmTarget(target, function()
 			return Config.Farm.Enabled
@@ -2126,7 +2324,7 @@ local CombatSection = FarmTab:Section({ Title = "Combate" })
 CombatSection:Dropdown({
 			Title = "Metodo de ataque",
 		Desc = "Auto = ativa a arma + ClickButton1 (mais confiavel no Blox)",
-		Values = { "Auto (todos)", "RegisterHit", "ClickButton1", "CommF Attack", "Tool:Activate", "Mouse1click" },
+		Values = { "Auto (todos)", "CombatFramework", "RegisterHit", "ClickButton1", "CommF Attack", "Tool:Activate", "Mouse1click" },
 	Value = "Auto (todos)",
 	Callback = function(option)
 		Config.Farm.AttackMethod = option
@@ -2211,6 +2409,16 @@ CombatSection:Button({
 		else
 			notify("Combate", "Nenhum mob atacavel no raio", "alert-triangle", 4)
 		end
+	end,
+})
+
+CombatSection:Button({
+	Title = "Diagnostico do motor de dano",
+	Desc = "Bate 10x e mostra dano, hits reais e estado do CombatFramework",
+	Callback = function()
+		task.spawn(function()
+			damageProbe()
+		end)
 	end,
 })
 
@@ -2787,7 +2995,8 @@ DebugSection:Button({
 		local sentOk, sentParts, sentReason = serverHit(Config.Farm.AuraRadius)
 		print("[MK4 Hubx] envio:", tostring(sentOk), sentParts, sentReason)
 		print("[MK4 Hubx] aura -> m1:", dbg.m1, "registerHit:", dbg.attacks, "partes:", dbg.parts, "motivo:", dbg.reason)
-		print("[MK4 Hubx] mouse hook (aura m1):", tostring(mouseHookOk))
+		print("[MK4 Hubx] golpes no CombatFramework:", dbg.swings, "| hits reais do cliente:", dbg.hits)
+		print("[MK4 Hubx] mouse hook (aura m1):", tostring(mouseHookOk), "| hit hook:", tostring(hitHookOk))
 		print("[MK4 Hubx] sweep -> rodadas:", dbg.sweeps, "partes:", dbg.sweepsSent)
 		print("[MK4 Hubx] Bau:", Config.Chest.Enabled, "Frutas:", Config.Fruit.Enabled, "Roll:", Config.Roll.Enabled)
 		print("[MK4 Hubx] Beli:", getBeli())
