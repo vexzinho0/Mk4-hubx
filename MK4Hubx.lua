@@ -5,6 +5,12 @@
    Tema: vermelho / preto (WindUI:AddTheme)
    Tabs: Farm, Events, Bau, Frutas, Utilitarios
 
+   v8: auto farm corrigido de vez. O farm nao anda mais com tween no
+     HumanoidRootPart (o servidor nao aceita esse movimento e o personagem
+     nunca chegava no NPC). Agora ele COLA no mob (CFrame a 3 studs), bate
+     no loop, confere a vida do mob e, se o golpe nao registrou, tenta
+     CommF Attack / Tool:Activate / clique virtual. Icone do hub em
+     assets/mk4-icon.png (splash desenhada no script).
    v7 (dados reais do MK4Dump + scripts abertos de 2026): o dano nao sai
      mais por RE/RegisterHit. O cliente manda RE/RegisterAttack e um pacote
      criptografado (ReplicatedStorage.Util.<id>) gerado pelo CombatFramework.
@@ -117,7 +123,7 @@ local Config = {
 		Enabled = false,
 		Mode = "Mais proximo",
 		Mob = "",
-		Radius = 300,
+		Radius = 800,
 		Speed = 130,
 		AttackDelay = 0.15,
 		FastAttack = true,
@@ -140,7 +146,12 @@ local Config = {
 		AuraSweep = true,
 		AuraSweepMax = 6,
 		AuraAllParts = true,
-		TeleportToMob = false,
+		-- Farm de verdade = colar no mob. Tween no HumanoidRootPart nao
+		-- replica movimento pro servidor, entao o personagem nunca chegava
+		-- no NPC e o M1 (que nasce na frente do personagem) nao acertava.
+		TeleportToMob = true,
+		-- tempo maximo batendo no mesmo mob antes de trocar de alvo
+		TargetTimeout = 25,
 		AutoQuest = false,
 		QuestId = "BanditQuest1",
 		QuestIndex = 1,
@@ -625,6 +636,9 @@ end
 --=====================================================================
 local mobCache = nil
 local mobCacheTime = 0
+-- Mobs que ficaram 20s sem tomar dano (alvo recusado pelo servidor).
+-- O farm pula esses por um tempo pra nao grudar num alvo inutil.
+local farmBad = {}
 
 -- NPCs com interacao (lojas, quest givers, barcos) nunca entram no magnet
 local NON_ATTACKABLE = {
@@ -722,12 +736,14 @@ local function nearestMob(radius, filterName)
 	end
 	local best, bestDistance = nil, radius or 300
 	for _, mob in ipairs(collectMobs()) do
-		local match = true
+		local badAt = farmBad[mob.Model]
+		local match = not (badAt and (os.clock() - badAt) < 20)
 		if filterName and filterName ~= "" then
 			local f = filterName:lower()
 			local name = mob.Name:lower()
 			-- o jogo nomeia os mobs "Bandit" / "Bandit [12]" / "Bandit2"
-			match = name == f or name:sub(1, #f + 1) == f .. " " or name:sub(1, #f) == f and tonumber(name:sub(#f + 1)) ~= nil
+			local nameOk = name == f or name:sub(1, #f + 1) == f .. " " or name:sub(1, #f) == f and tonumber(name:sub(#f + 1)) ~= nil
+			match = match and nameOk
 		end
 		if match then
 			local distance = (mob.Root.Position - hrp.Position).Magnitude
@@ -1396,9 +1412,50 @@ local function killAura()
 	end
 end
 
+-- Distancia que o personagem fica do mob. O M1 do Blox Fruits nasce na
+-- frente do personagem, entao tem que ficar colado: os farms abertos
+-- (Axonic, drewodiferente, JojoPujo) usam mob.HumanoidRootPart.CFrame *
+-- CFrame.new(0, 0, 3).
+local FARM_STAND = 3
+
+-- Cola no mob: se ja esta perto so vira o personagem pro alvo; se esta
+-- longe, teleporta pra 3 studs na frente dele. Chamado a cada golpe, entao
+-- tambem desfaz o empurrao/knockback que joga o player pra fora do hitbox.
+local function standNextTo(mob)
+	local hrp = getHRP()
+	if not hrp or not mob.Root or not mob.Root.Parent then
+		return nil
+	end
+	local targetPos = mob.Root.Position
+	local delta = hrp.Position - targetPos
+	local flat = Vector3.new(delta.X, 0, delta.Z)
+	local distance = flat.Magnitude
+	if distance <= 6 and math.abs(delta.Y) < 8 then
+		pcall(function()
+			hrp.CFrame = CFrame.new(hrp.Position, Vector3.new(targetPos.X, hrp.Position.Y, targetPos.Z))
+		end)
+		return distance
+	end
+	if not Config.Farm.TeleportToMob then
+		-- toggle desligado: so bate se o mob ja estiver no alcance
+		return distance
+	end
+	if flat.Magnitude < 0.1 then
+		flat = Vector3.new(0, 0, 1)
+	end
+	local stand = targetPos + flat.Unit * FARM_STAND
+	pcall(function()
+		hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+		hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+		hrp.CFrame = CFrame.new(stand, targetPos)
+	end)
+	return (hrp.Position - targetPos).Magnitude
+end
+
 -- keepGoing: funcao que decide se o combate continua
--- O farm de verdade precisa CHEGAR no mob: o M1 nasce no personagem, entao
--- longe do alvo nao existe dano nenhum. Alterna entre andar ate ele e bater.
+-- Loop do farm: 1) cola no mob, 2) da o golpe real, 3) confere se a vida
+-- caiu, 4) se o golpe nao registrou nada em ~1s, tenta os caminhos antigos
+-- (CommF Attack, Tool:Activate, clique virtual) sem sair do lugar.
 local function farmTarget(target, keepGoing)
 	if not target then
 		return
@@ -1411,37 +1468,65 @@ local function farmTarget(target, keepGoing)
 	local active = keepGoing or function()
 		return Config.Farm.Enabled
 	end
-	-- distancia em que o golpe encosta: o hitbox vai de ~30 a ~150 studs
-	local reach = math.clamp((Config.Farm.HitboxMagnitude or 60) * 0.35, 8, 45)
+	local hpBefore = mhum.Health
+	local hitsMark = dbg.hits
+	local markTime = os.clock()
+	local triedFallback = false
+	local announced = false
+	local dealtAny = false
 	installHitHook()
+	installMouseHook()
 
-	while active() and mob.Parent and mhum.Health > 0 and (os.clock() - started) < 25 do
-		local hrp = getHRP()
-		if not hrp then
+	while active() and mob.Parent and mhrp.Parent and mhum.Health > 0
+		and (os.clock() - started) < (Config.Farm.TargetTimeout or 25) do
+		if not getChar() then
 			break
 		end
-		local distance = (mhrp.Position - hrp.Position).Magnitude
-		if distance > reach then
-			if Config.Farm.TeleportToMob or distance > 400 then
-				pcall(function()
-					hrp.CFrame = mhrp.CFrame * CFrame.new(0, 2, 3)
-				end)
-				task.wait(0.1)
-			else
-				-- tween na direcao do mob (bloqueia ate chegar, ~1s)
-				local goal = mhrp.Position + (hrp.Position - mhrp.Position).Unit * reach * 0.6
-				moveTo(goal + Vector3.new(0, 2, 0), Config.Farm.Speed)
-			end
+		ensureWeapon(true)
+		local distance = standNextTo(target)
+		m1Attack(target)
+		if Config.Farm.ServerHit then
+			serverHit(Config.Farm.AuraRange, mob)
 		end
 		if Config.Farm.AutoBuso and (os.clock() - lastBuso) > 2 then
 			lastBuso = os.clock()
 			invoke("Buso")
 		end
-		m1Attack(target)
-		if Config.Farm.ServerHit then
-			serverHit(Config.Farm.AuraRange, mob)
+		dbg.lastTarget = mob.Name
+
+		task.wait(Config.Farm.FastAttack and math.max(Config.Farm.AttackDelay, 0.05) or 0.45)
+
+		-- o HP do mob e a prova do dano; dbg.hits prova que o cliente mandou
+		local hpNow = mhum.Health
+		if hpNow < hpBefore or dbg.hits > hitsMark then
+			dealtAny = (dealtAny or hpNow < hpBefore)
+			hpBefore, hitsMark, markTime = hpNow, dbg.hits, os.clock()
+			triedFallback = false
+		elseif (os.clock() - markTime) > 1.2 then
+			markTime = os.clock()
+			if not triedFallback then
+				triedFallback = true
+				invoke("Attack", mob)
+				local tool = getWeapon()
+				if tool then
+					pcall(function()
+						tool:Activate()
+					end)
+				end
+				virtualClick()
+			end
+			if not announced then
+				announced = true
+				print(("[MK4 Hubx] farm: %s a %.0f studs sem dano (golpes %d, hits %d, melee %s)"):format(
+					mob.Name, distance or -1, dbg.swings, dbg.hits, (equippedMelee() and equippedMelee().Name or "NENHUMA")
+				))
+			end
 		end
-		task.wait(Config.Farm.FastAttack and Config.Farm.AttackDelay or 0.45)
+	end
+	-- mob que nao tomou dano nenhum fica 20s de lado, senao o farm gruda
+	-- num alvo que o servidor nao aceita e nao sai mais do lugar
+	if not dealtAny and mob.Parent then
+		farmBad[mob] = os.clock()
 	end
 end
 
@@ -1885,7 +1970,9 @@ startLoop("noclip", function()
 end)
 
 startLoop("aura", function()
-	if not Config.Farm.KillAura then
+	-- Com o farm ligado quem manda no alvo/teleporte e o farm; a aura
+	-- roubava o mouse e teleportava de volta pro lugar, quebrando o farm.
+	if not Config.Farm.KillAura or Config.Farm.Enabled then
 		task.wait(0.3)
 		return
 	end
@@ -1911,14 +1998,22 @@ startLoop("farm", function()
 	local filter = Config.Farm.Mode == "Mob especifico" and Config.Farm.Mob or nil
 	local target
 	if quest and Config.Farm.AutoQuest and Config.Farm.Mode ~= "Mob especifico" then
-		target = nearestMob(Config.Farm.AuraRadius, quest.mob)
+		-- raio de busca do farm (nao o da aura): o mob da quest fica longe
+		target = nearestMob(Config.Farm.Radius, quest.mob)
 	end
 	target = target or nearestMob(Config.Farm.Radius, filter)
 	if not target and quest and Config.Farm.AutoQuest and Config.Farm.Mode ~= "Mob especifico" then
 		-- Nenhum mob do nivel por perto: vai pra area da quest e espera o spawn
 		if Config.Farm.QuestPos ~= quest.position then
 			Config.Farm.QuestPos = quest.position
-			moveTo(quest.position + Vector3.new(0, 3, 0), Config.Farm.Speed)
+			local hrp = getHRP()
+			if Config.Farm.TeleportToMob and hrp then
+				pcall(function()
+					hrp.CFrame = CFrame.new(quest.position + Vector3.new(0, 3, 0))
+				end)
+			else
+				moveTo(quest.position + Vector3.new(0, 3, 0), Config.Farm.Speed)
+			end
 		end
 		task.wait(0.2)
 		return
@@ -2077,6 +2172,108 @@ local MK4_RED = {
 pcall(function()
 	WindUI:AddTheme(MK4_RED)
 	WindUI:SetTheme("MK4 Red")
+end)
+
+--=====================================================================
+-- 11.1 ICONE DO HUB
+--=====================================================================
+-- A arte fica em assets/mk4-icon.png. O Roblox nao aceita imagem local,
+-- entao sem upload o script desenha o emblema MK4 em codigo (sempre
+-- aparece). Pra usar a arte de verdade: Creator Dashboard > Decals >
+-- upload do PNG, e cole o id abaixo (ex: "rbxassetid://1234567890").
+local ICON_ASSET_ID = ""
+
+local function hubIcon(size)
+	local frame = Instance.new("Frame")
+	frame.Size = size or UDim2.fromOffset(96, 96)
+	frame.BackgroundColor3 = Color3.fromHex("#0b0505")
+	frame.BorderSizePixel = 0
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 22)
+	corner.Parent = frame
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromHex("#ff3b3b")
+	stroke.Thickness = 3
+	stroke.Transparency = 0.15
+	stroke.Parent = frame
+	if ICON_ASSET_ID ~= "" then
+		local img = Instance.new("ImageLabel")
+		img.Size = UDim2.fromScale(1, 1)
+		img.BackgroundTransparency = 1
+		img.Image = ICON_ASSET_ID
+		img.ScaleType = Enum.ScaleType.Crop
+		img.Parent = frame
+		local ic = Instance.new("UICorner")
+		ic.CornerRadius = UDim.new(0, 22)
+		ic.Parent = img
+	else
+		local text = Instance.new("TextLabel")
+		text.Size = UDim2.fromScale(1, 1)
+		text.BackgroundTransparency = 1
+		text.Font = Enum.Font.GothamBlack
+		text.Text = "MK4"
+		text.TextColor3 = Color3.fromHex("#ff3b3b")
+		text.TextScaled = true
+		text.Parent = frame
+		local pad = Instance.new("UIPadding")
+		pad.PaddingLeft = UDim.new(0, 16)
+		pad.PaddingRight = UDim.new(0, 16)
+		pad.PaddingTop = UDim.new(0, 24)
+		pad.PaddingBottom = UDim.new(0, 30)
+		pad.Parent = text
+		local bar = Instance.new("Frame")
+		bar.AnchorPoint = Vector2.new(0.5, 1)
+		bar.Position = UDim2.new(0.5, 0, 1, -14)
+		bar.Size = UDim2.new(0.5, 0, 0, 4)
+		bar.BackgroundColor3 = Color3.fromHex("#ff3b3b")
+		bar.BorderSizePixel = 0
+		bar.Parent = frame
+		local bc = Instance.new("UICorner")
+		bc.CornerRadius = UDim.new(1, 0)
+		bc.Parent = bar
+	end
+	return frame
+end
+
+-- Splash curta com o icone enquanto o hub monta a interface
+pcall(function()
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "MK4HubxSplash"
+	gui.IgnoreGuiInset = true
+	gui.ResetOnSpawn = false
+	gui.DisplayOrder = 9999
+	local coreOk, core = pcall(function()
+		return game:GetService("CoreGui")
+	end)
+	gui.Parent = (coreOk and core) or LP:WaitForChild("PlayerGui")
+
+	local badge = hubIcon(UDim2.fromOffset(150, 150))
+	badge.AnchorPoint = Vector2.new(0.5, 0.5)
+	badge.Position = UDim2.fromScale(0.5, 0.45)
+	badge.Parent = gui
+
+	local label = Instance.new("TextLabel")
+	label.AnchorPoint = Vector2.new(0.5, 0)
+	label.Position = UDim2.new(0.5, 0, 0.45, 88)
+	label.Size = UDim2.fromOffset(220, 26)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.GothamBold
+	label.Text = "MK4 HUBX  |  v7"
+	label.TextColor3 = Color3.fromHex("#f6e9e9")
+	label.TextSize = 18
+	label.Parent = gui
+
+	task.delay(2.4, function()
+		pcall(function()
+			local info = TweenInfo.new(0.45, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+			TweenService:Create(badge, info, { BackgroundTransparency = 1 }):Play()
+			TweenService:Create(label, info, { TextTransparency = 1 }):Play()
+		end)
+		task.wait(0.5)
+		pcall(function()
+			gui:Destroy()
+		end)
+	end)
 end)
 
 --=====================================================================
@@ -2277,7 +2474,7 @@ FarmSection:Button({
 FarmSection:Slider({
 	Title = "Raio de busca",
 	Step = 10,
-	Value = { Min = 50, Max = 2000, Default = 300 },
+	Value = { Min = 50, Max = 4000, Default = 800 },
 	Callback = function(value)
 		Config.Farm.Radius = value
 	end,
@@ -2362,8 +2559,8 @@ CombatSection:Slider({
 
 CombatSection:Toggle({
 	Title = "Teleportar ate o mob",
-	Desc = "Desligado = farma parado so com a Kill Aura",
-	Value = false,
+	Desc = "Recomendado: cola no alvo (o M1 so acerta colado)",
+	Value = true,
 	Callback = function(state)
 		Config.Farm.TeleportToMob = state
 	end,
@@ -2925,6 +3122,13 @@ pcall(function()
 	end
 end)
 
+local AboutSection = UtilTab:Section({ Title = "MK4 Hubx" })
+
+AboutSection:Paragraph({
+	Title = "MK4 Hubx | Blox Fruits",
+	Desc = "Sem key. Kill aura e auto farm usam o golpe real do CombatFramework: o farm cola no mob e bate ate a vida cair. Arte do icone: assets/mk4-icon.png no repositorio.",
+})
+
 ThemeSection:Dropdown({
 	Title = "Tema",
 	Desc = "MK4 Red = vermelho / preto",
@@ -2996,6 +3200,7 @@ DebugSection:Button({
 		print("[MK4 Hubx] envio:", tostring(sentOk), sentParts, sentReason)
 		print("[MK4 Hubx] aura -> m1:", dbg.m1, "registerHit:", dbg.attacks, "partes:", dbg.parts, "motivo:", dbg.reason)
 		print("[MK4 Hubx] golpes no CombatFramework:", dbg.swings, "| hits reais do cliente:", dbg.hits)
+		print("[MK4 Hubx] farm -> alvo:", dbg.lastTarget or "nenhum", "| teleportar:", Config.Farm.TeleportToMob, "| raio de busca:", Config.Farm.Radius)
 		print("[MK4 Hubx] mouse hook (aura m1):", tostring(mouseHookOk), "| hit hook:", tostring(hitHookOk))
 		print("[MK4 Hubx] sweep -> rodadas:", dbg.sweeps, "partes:", dbg.sweepsSent)
 		print("[MK4 Hubx] Bau:", Config.Chest.Enabled, "Frutas:", Config.Fruit.Enabled, "Roll:", Config.Roll.Enabled)
